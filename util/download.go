@@ -66,7 +66,7 @@ type ChunkData struct {
 
 // 获取文件大小
 func getFileSize(url string) (int64, error) {
-	resp, err := httpClient.c.Head(url)
+	resp, err := GetHttpClient().c.Head(url)
 	if err != nil {
 		return 0, err
 	}
@@ -224,6 +224,22 @@ func StartDownloadFile(url string, filepath string, filesize int64, numThreads i
 	//	}(int64(i), start, end)
 	//}
 
+	go func() {
+		for {
+			select {
+			case chunk := <-chunkQueue:
+				semaphore <- struct{}{}
+				go func() {
+					downloadChunk(ctx, chunk, chunk.Index, sigChan, bar)
+					<-semaphore
+				}()
+			case <-ctx.Done():
+				log.Logger().Info("Chunk队列监听线程已退出")
+				return
+
+			}
+		}
+	}()
 	for {
 		if isCompleted {
 			break
@@ -247,12 +263,6 @@ func StartDownloadFile(url string, filepath string, filesize int64, numThreads i
 				log.Logger().Sugar().Error("线程", signal.TID, " 下载出错")
 				cancel()
 			}
-		case semaphore <- struct{}{}:
-			chunk := <-chunkQueue
-			go func() {
-				downloadChunk(ctx, chunk, chunk.Index, sigChan, bar)
-				<-semaphore
-			}()
 		}
 
 	}
