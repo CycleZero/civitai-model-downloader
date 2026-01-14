@@ -116,7 +116,7 @@ func init() {
 	downloadCommand.PersistentFlags().StringVar(&ModelHash, "hash", "", "model hash")
 	downloadCommand.PersistentFlags().StringVarP(&DownloadDir, "downloadDir", "o", "", "download dir")
 	downloadCommand.PersistentFlags().StringVarP(&ModelVersionId, "modelVersionId", "v", "", "model version id")
-	downloadCommand.PersistentFlags().IntVarP(&NumThreads, "numThreads", "t", 1, "num threads")
+	downloadCommand.PersistentFlags().IntVarP(&NumThreads, "numThreads", "t", 8, "num threads")
 	downloadCommand.PersistentFlags().Int64VarP(&MaxChunkSize, "maxChunkSize", "s", 1024*1024*1024, "max chunk size")
 	rootCmd.AddCommand(downloadCommand)
 }

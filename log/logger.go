@@ -60,7 +60,7 @@ func NewConsoleLogger() (*zap.Logger, error) {
 		zapcore.AddSync(color.Output),
 		zapcore.DebugLevel,
 	)
-	return zap.New(core), nil
+	return zap.New(core, zap.AddCaller()), nil
 
 }
 
