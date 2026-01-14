@@ -98,6 +98,7 @@ func GetModelNameByDownloadUrl(downloadUrl string) (string, error) {
 		return "", err
 	}
 	req.Header.Add("Range", rangeHeader)
+	req.Header.Add("Authorization", util.AuthHeader["Authorization"])
 	res, err := util.GetHttpClient().GetRawClient().Do(req)
 	if err != nil {
 		return "", err
