@@ -4,10 +4,11 @@ import (
 	"civitai-model-downloader/log"
 	"civitai-model-downloader/util"
 	"fmt"
-	"github.com/spf13/cobra"
-	"github.com/spf13/viper"
 	"os"
 	"os/user"
+
+	"github.com/spf13/cobra"
+	"github.com/spf13/viper"
 )
 
 var ConfigFilePath string
@@ -49,7 +50,7 @@ func initConfig() (*viper.Viper, error) {
 		_, err := os.Stat(DefaultConfigPath())
 		if err != nil {
 			if os.IsNotExist(err) {
-				file, err := util.CreatFile(DefaultConfigPath())
+				file, err := util.CreateFile(DefaultConfigPath())
 				if err != nil {
 					return nil, err
 				}
