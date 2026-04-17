@@ -5,9 +5,10 @@ import (
 	"civitai-model-downloader/log"
 	"civitai-model-downloader/util"
 	"fmt"
-	"github.com/spf13/cobra"
 	"net/http"
 	"strings"
+
+	"github.com/spf13/cobra"
 )
 
 var DownloadUrl string
@@ -74,8 +75,27 @@ var downloadCommand = &cobra.Command{
 			return
 		}
 
-		err := util.StartDownloadFile(DownloadUrl, DownloadDir+"/"+ModelName, fileSize, NumThreads, MaxChunkSize)
+		log.Logger().Sugar().Info("开始下载")
+		log.Logger().Sugar().Info("下载地址:", DownloadUrl)
+		log.Logger().Sugar().Info("保存路径:", DownloadDir+"/"+ModelName)
+		log.Logger().Sugar().Info("文件名:", ModelName)
+		log.Logger().Sugar().Info("文件大小:", fileSize)
+		log.Logger().Sugar().Info("线程数:", NumThreads)
+
+		//err := util.StartDownloadFile(DownloadUrl, DownloadDir+"/"+ModelName, fileSize, NumThreads, MaxChunkSize)
 		//err := util.DownloadDirect(DownloadUrl, DownloadDir+"/"+ModelName, fileSize)
+		c := util.Config{
+			Concurrency:      8,
+			MaxRetries:       3,
+			RetryBackoffBase: 1,
+			HTTPTimeout:      5,
+			VerifyChecksum:   false,
+			ExpectedSHA256:   "",
+			Headers:          nil,
+			Logger:           log.Logger(),
+		}
+		d, err := util.NewDownloader(DownloadUrl, DownloadDir+"/"+ModelName, &c)
+		err = d.Download()
 		if err != nil {
 			log.Logger().Sugar().Error(err)
 			return
