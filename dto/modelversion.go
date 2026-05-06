@@ -1,29 +1,41 @@
 package dto
 
-import "time"
+import (
+	"encoding/json"
+	"time"
+)
 
-// ModelVersion represents a specific version of a model, containing nested model information.
-type ModelVersionIdResponse struct {
-	ID           int64     `json:"id"`           // The identifier for the model version
-	Name         string    `json:"name"`         // The name of the model version
-	Description  string    `json:"description"`  // The description of the model version (usually a changelog)
-	Model        ModelInfo `json:"model"`        // Embedded information about the parent model
-	ModelID      int64     `json:"modelId"`      // The identifier for the parent model
-	CreatedAt    time.Time `json:"createdAt"`    // The date in which the version was created
-	DownloadURL  string    `json:"downloadUrl"`  // The download url to get the model file for this specific version
-	TrainedWords []string  `json:"trainedWords"` // The words used to trigger the model
-	Files        []File    `json:"files"`        // The files associated with this model version
-	Stats        Stats     `json:"stats"`        // Statistics related to the model
-	Images       []Image   `json:"images"`       // The images associated with this model version
+// ModelVersionFull is the response from:
+//
+//	GET /api/v1/model-versions/{id}
+//	GET /api/v1/model-versions/by-hash/{hash}
+type ModelVersionFull struct {
+	ID                int              `json:"id"`
+	ModelID           int              `json:"modelId"`
+	Name              string           `json:"name"`
+	Description       *string          `json:"description"`
+	BaseModel         string           `json:"baseModel"`
+	BaseModelType     string           `json:"baseModelType"`
+	AIR               string           `json:"air"`
+	Status            string           `json:"status"`
+	Availability      string           `json:"availability"`
+	NSFWLevel         int              `json:"nsfwLevel"`
+	CreatedAt         time.Time        `json:"createdAt"`
+	UpdatedAt         time.Time        `json:"updatedAt"`
+	PublishedAt       time.Time        `json:"publishedAt"`
+	UploadType        string           `json:"uploadType"`
+	UsageControl      string           `json:"usageControl"`
+	TrainedWords      []string         `json:"trainedWords"`
+	EarlyAccessConfig *json.RawMessage `json:"earlyAccessConfig"`
+	EarlyAccessEndsAt *time.Time       `json:"earlyAccessEndsAt"`
+	TrainingStatus    *string          `json:"trainingStatus"`
+	TrainingDetails   *json.RawMessage `json:"trainingDetails"`
+	Stats             *VersionStats    `json:"stats,omitempty"`
+	Model             *ModelInfo       `json:"model,omitempty"`
+	Files             []File           `json:"files"`
+	Images            []Image          `json:"images"`
+	DownloadURL       string           `json:"downloadUrl"`
 }
 
-// ModelInfo contains information about the parent model of a ModelVersion.
-type ModelInfo struct {
-	Name string  `json:"name"` // The name of the model
-	Type string  `json:"type"` // The model type (Checkpoint, TextualInversion, etc.)
-	NSFW bool    `json:"nsfw"` // Whether the model is NSFW or not
-	POI  bool    `json:"poi"`  // Whether the model is of a person of interest or not
-	Mode *string `json:"mode"` // The mode of the model (Archived, TakenDown, or null)
-}
-
-// Stats contains statistics about the model.
+// ModelVersionIdResponse is the old name, kept for backward compat.
+type ModelVersionIdResponse = ModelVersionFull

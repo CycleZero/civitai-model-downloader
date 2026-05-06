@@ -1,143 +1,156 @@
 package cmd
 
 import (
+	"context"
+	"fmt"
+	"net/http"
+	"os"
+	"os/signal"
+	"strings"
+	"syscall"
+
 	"civitai-model-downloader/api"
 	"civitai-model-downloader/log"
 	"civitai-model-downloader/util"
-	"fmt"
-	"net/http"
-	"strings"
+	"civitai-model-downloader/util/downloader"
 
 	"github.com/spf13/cobra"
 )
 
-var DownloadUrl string
+var (
+	DownloadUrl     string
+	ModelId         string
+	ModelVersionId  string
+	ModelName       string
+	ModelHash       string
+	DownloadDir     string
+	NumThreads      int
+	MaxChunkSize    int64
+)
 
-var ModelId string
-
-var ModelVersionId string
-
-var ModelName string
-
-var ModelHash string
-
-var DownloadDir string
-
-var NumThreads int
-
-var MaxChunkSize int64
 var downloadCommand = &cobra.Command{
-
 	Use: "download",
-
 	Run: func(cmd *cobra.Command, args []string) {
-		var fileSize int64
 		if DownloadDir == "" {
-			DownloadDir = "./"
+			DownloadDir = "."
 		}
+
 		if DownloadUrl != "" {
-			//TODO 直接下载
+			if ModelName == "" {
+				var err error
+				ModelName, err = resolveFilename(DownloadUrl)
+				if err != nil {
+					log.Logger().Sugar().Errorf("resolve filename: %v", err)
+					return
+				}
+			}
 		} else if ModelHash != "" {
 			model, err := api.GetModelByHash(ModelHash)
 			if err != nil {
-				log.Logger().Sugar().Error(err)
-				return
-			}
-			ModelName, err = GetModelNameByDownloadUrl(model.DownloadURL)
-			if err != nil {
-				log.Logger().Sugar().Error(err)
+				log.Logger().Sugar().Errorf("api: %v", err)
 				return
 			}
 			DownloadUrl = model.DownloadURL
-			fileSize = int64(model.Files[0].SizeKb * 1024)
+			if ModelName == "" {
+				var err error
+				ModelName, err = resolveFilename(DownloadUrl)
+				if err != nil && len(model.Files) > 0 && model.Files[0].Name != "" {
+					ModelName = model.Files[0].Name
+				} else if err != nil {
+					log.Logger().Sugar().Errorf("resolve filename: %v", err)
+					return
+				}
+			}
 		} else if ModelVersionId != "" {
 			model, err := api.GetModelByVersionId(ModelVersionId)
 			if err != nil {
-				log.Logger().Sugar().Error(err)
+				log.Logger().Sugar().Errorf("api: %v", err)
 				return
 			}
 			ModelName = model.Name
 			DownloadUrl = model.DownloadURL
-
 		} else if ModelId != "" {
-			log.Logger().Error("不支持")
+			log.Logger().Error("model-id download not yet implemented, use --hash or --modelVersionId")
 			return
-			//model, err := api.GetModelById(ModelId)
-			//if err != nil {
-			//	log.Logger().Sugar().Error(err)
-			//	return
-			//}
-			//ModelName = model.Name
-			//DownloadUrl = model.DownloadURL
-			//
 		} else {
-			log.Logger().Error("请选择下载方式")
+			log.Logger().Error("specify --url, --hash, --modelVersionId, or --modelId")
 			return
 		}
 
-		log.Logger().Sugar().Info("开始下载")
-		log.Logger().Sugar().Info("下载地址:", DownloadUrl)
-		log.Logger().Sugar().Info("保存路径:", DownloadDir+"/"+ModelName)
-		log.Logger().Sugar().Info("文件名:", ModelName)
-		log.Logger().Sugar().Info("文件大小:", fileSize)
-		log.Logger().Sugar().Info("线程数:", NumThreads)
+		outPath := DownloadDir + "/" + ModelName
 
-		//err := util.StartDownloadFile(DownloadUrl, DownloadDir+"/"+ModelName, fileSize, NumThreads, MaxChunkSize)
-		//err := util.DownloadDirect(DownloadUrl, DownloadDir+"/"+ModelName, fileSize)
-		c := util.Config{
-			Concurrency:      8,
-			MaxRetries:       3,
-			RetryBackoffBase: 1,
-			HTTPTimeout:      5,
-			VerifyChecksum:   false,
-			ExpectedSHA256:   "",
-			Headers:          nil,
-			Logger:           log.Logger(),
+		log.Logger().Sugar().Infof("downloading %s -> %s", DownloadUrl, outPath)
+
+		cfg := &downloader.Config{
+			Concurrency: NumThreads,
+			MaxRetries:  3,
+			HTTPTimeout: 0,
+			Headers:     util.AuthHeader,
+			Resume:      true,
+			Logger:      log.Logger(),
 		}
-		d, err := util.NewDownloader(DownloadUrl, DownloadDir+"/"+ModelName, &c)
-		err = d.Download()
-		if err != nil {
-			log.Logger().Sugar().Error(err)
+
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+
+		// graceful shutdown on SIGINT/SIGTERM
+		sigCh := make(chan os.Signal, 1)
+		signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
+		go func() {
+			<-sigCh
+			log.Logger().Sugar().Info("interrupted, saving state...")
+			cancel()
+		}()
+
+		dl := downloader.New(DownloadUrl, outPath, cfg)
+		if err := dl.Download(ctx); err != nil {
+			log.Logger().Sugar().Errorf("download: %v", err)
 			return
 		}
-
-		if err != nil {
-
-			log.Logger().Sugar().Error(err)
-			return
-		}
-		log.Logger().Sugar().Info("下载完成")
-		return
+		log.Logger().Sugar().Infof("download complete: %s", outPath)
 	},
 }
 
-func GetModelNameByDownloadUrl(downloadUrl string) (string, error) {
-	rangeHeader := fmt.Sprintf("bytes=%d-%d", 0, 1)
-	req, err := http.NewRequest("GET", downloadUrl, nil)
+func resolveFilename(url string) (string, error) {
+	req, err := http.NewRequest("GET", url, nil)
 	if err != nil {
 		return "", err
 	}
-	req.Header.Add("Range", rangeHeader)
-	req.Header.Add("Authorization", util.AuthHeader["Authorization"])
-	res, err := util.GetHttpClient().GetRawClient().Do(req)
+	req.Header.Set("Range", "bytes=0-1")
+	if util.AuthHeader != nil {
+		for k, v := range util.AuthHeader {
+			req.Header.Set(k, v)
+		}
+	}
+	resp, err := util.GetHttpClient().GetRawClient().Do(req)
 	if err != nil {
 		return "", err
 	}
-	h := res.Header.Get("Content-Disposition")
-	f := h[strings.Index(h, "filename=")+9:]
+	defer resp.Body.Close()
+
+	cd := resp.Header.Get("Content-Disposition")
+	idx := strings.Index(cd, "filename=")
+	if idx < 0 {
+		return "", fmt.Errorf("no filename in Content-Disposition: %s", cd)
+	}
+	f := cd[idx+9:]
+	f = strings.Trim(f, `"`)
+	if idx2 := strings.Index(f, `";`); idx2 > 0 {
+		f = f[:idx2]
+	}
 	if f == "" {
-		return "", fmt.Errorf("no filename")
+		return "", fmt.Errorf("empty filename")
 	}
-	f = strings.Trim(f, "\"")
 	return f, nil
 }
+
 func init() {
-	downloadCommand.PersistentFlags().StringVarP(&DownloadUrl, "url", "u", "", "download url")
-	downloadCommand.PersistentFlags().StringVarP(&ModelId, "modelId", "m", "", "model id")
+	downloadCommand.PersistentFlags().StringVarP(&DownloadUrl, "url", "u", "", "direct download URL")
+	downloadCommand.PersistentFlags().StringVarP(&ModelId, "modelId", "m", "", "model ID")
 	downloadCommand.PersistentFlags().StringVar(&ModelHash, "hash", "", "model hash")
-	downloadCommand.PersistentFlags().StringVarP(&DownloadDir, "downloadDir", "o", "", "download dir")
-	downloadCommand.PersistentFlags().StringVarP(&ModelVersionId, "modelVersionId", "v", "", "model version id")
-	downloadCommand.PersistentFlags().IntVarP(&NumThreads, "numThreads", "t", 8, "num threads")
-	downloadCommand.PersistentFlags().Int64VarP(&MaxChunkSize, "maxChunkSize", "s", 1024*1024*1024, "max chunk size")
+	downloadCommand.PersistentFlags().StringVarP(&DownloadDir, "downloadDir", "o", "", "output directory")
+	downloadCommand.PersistentFlags().StringVarP(&ModelVersionId, "modelVersionId", "v", "", "model version ID")
+	downloadCommand.PersistentFlags().IntVarP(&NumThreads, "numThreads", "t", 8, "number of concurrent download threads")
+	downloadCommand.PersistentFlags().Int64VarP(&MaxChunkSize, "maxChunkSize", "s", 1024*1024*1024, "max chunk size (unused, kept for compat)")
 	rootCmd.AddCommand(downloadCommand)
 }

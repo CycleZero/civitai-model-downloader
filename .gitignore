@@ -5,3 +5,6 @@ config.*
 
 bin/
 
+*.exe
+
+*.safetensors

@@ -1,11 +1,9 @@
 package util
 
 import (
-	"bytes"
-	"crypto/tls"
+	"fmt"
 	"io"
 	"net/http"
-	"net/url"
 	"time"
 )
 
@@ -16,22 +14,15 @@ type HttpClient struct {
 }
 
 func NewHttpClient() *HttpClient {
-	c := &http.Client{
-		Timeout: 0 * time.Second,
-		Transport: &http.Transport{
-			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
-			Proxy: func(req *http.Request) (*url.URL, error) {
-				// 在这里指定您的代理地址
-				proxyURL, err := url.Parse("http://127.0.0.1:7890") // 示例代理地址
-				if err != nil {
-					return nil, err
-				}
-				return proxyURL, nil
+	return &HttpClient{
+		c: &http.Client{
+			Timeout: 0,
+			Transport: &http.Transport{
+				Proxy:           http.ProxyFromEnvironment,
+				MaxIdleConns:    100,
+				IdleConnTimeout: 90 * time.Second,
 			},
 		},
-	}
-	return &HttpClient{
-		c: c,
 	}
 }
 
@@ -50,36 +41,18 @@ func (c *HttpClient) Get(url string, headers map[string]string) ([]byte, error) 
 	for k, v := range headers {
 		req.Header.Set(k, v)
 	}
-	res, err := c.c.Do(req)
+	resp, err := c.c.Do(req)
 	if err != nil {
 		return nil, err
 	}
-	defer res.Body.Close()
-	r, err := io.ReadAll(res.Body)
-	if err != nil {
-		return nil, err
-	}
-	return r, nil
-}
+	defer resp.Body.Close()
 
-func (c *HttpClient) Post(url string, body []byte, headers map[string]string) ([]byte, error) {
-	req, err := http.NewRequest("POST", url, bytes.NewReader(body))
-	if err != nil {
-		return nil, err
+	if resp.StatusCode >= 400 {
+		limit := io.LimitReader(resp.Body, 512)
+		body, _ := io.ReadAll(limit)
+		return nil, &HTTPError{Code: resp.StatusCode, Body: string(body)}
 	}
-	for k, v := range headers {
-		req.Header.Set(k, v)
-	}
-	res, err := c.c.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer res.Body.Close()
-	r, err := io.ReadAll(res.Body)
-	if err != nil {
-		return nil, err
-	}
-	return r, nil
+	return io.ReadAll(resp.Body)
 }
 
 func (c *HttpClient) GetRawClient() *http.Client {
@@ -87,6 +60,21 @@ func (c *HttpClient) GetRawClient() *http.Client {
 }
 
 func (c *HttpClient) Do(req *http.Request) (*http.Response, error) {
-	req.Header.Set("Authorization", AuthHeader["Authorization"])
+	if AuthHeader != nil {
+		if _, ok := req.Header["Authorization"]; !ok {
+			if v := AuthHeader["Authorization"]; v != "" {
+				req.Header.Set("Authorization", v)
+			}
+		}
+	}
 	return c.c.Do(req)
+}
+
+type HTTPError struct {
+	Code int
+	Body string
+}
+
+func (e *HTTPError) Error() string {
+	return fmt.Sprintf("HTTP %d: %s", e.Code, e.Body)
 }

@@ -2,344 +2,322 @@ package dto
 
 import (
 	"net/url"
-	"reflect"
 	"strconv"
 	"strings"
 	"time"
 )
 
-// ModelRequest represents the query parameters for the GET /api/v1/models endpoint.
-// All fields are pointers to handle optional parameters correctly.
+// ── Request ─────────────────────────────────────────
+
 type ModelRequest struct {
-	Limit                  *int     `url:"limit,omitempty"`
-	Page                   *int     `url:"page,omitempty"`
-	Query                  *string  `url:"query,omitempty"`
-	Tag                    *string  `url:"tag,omitempty"`
-	Username               *string  `url:"username,omitempty"`
-	Types                  []string `url:"types,omitempty,comma"` // enum[]
-	Sort                   *string  `url:"sort,omitempty"`        // enum
-	Period                 *string  `url:"period,omitempty"`      // enum
-	Rating                 *int     `url:"rating,omitempty"`      // Deprecated
-	Favorites              *bool    `url:"favorites,omitempty"`
-	Hidden                 *bool    `url:"hidden,omitempty"`
-	PrimaryFileOnly        *bool    `url:"primaryFileOnly,omitempty"`
-	AllowNoCredit          *bool    `url:"allowNoCredit,omitempty"`
-	AllowDerivatives       *bool    `url:"allowDerivatives,omitempty"`
-	AllowDifferentLicenses *bool    `url:"allowDifferentLicenses,omitempty"`
-	AllowCommercialUse     []string `url:"allowCommercialUse,omitempty,comma"` // enum[]
-	NSFW                   *bool    `url:"nsfw,omitempty"`
-	SupportsGeneration     *bool    `url:"supportsGeneration,omitempty"`
-	IDs                    []int    `url:"ids,omitempty,comma"`
-	BaseModels             []string `url:"baseModels,omitempty,comma"`
+	Limit           *int     `url:"limit,omitempty"`
+	Page            *int     `url:"page,omitempty"`
+	Cursor          *string  `url:"cursor,omitempty"`
+	Query           *string  `url:"query,omitempty"`
+	IDs             []int    `url:"ids,omitempty,comma"`
+	Tag             *string  `url:"tag,omitempty"`
+	Username        *string  `url:"username,omitempty"`
+	Types           []string `url:"types,omitempty,comma"`
+	BaseModels      []string `url:"baseModels,omitempty,comma"`
+	CheckpointType  *string  `url:"checkpointType,omitempty"`
+	Sort            *string  `url:"sort,omitempty"`
+	Period          *string  `url:"period,omitempty"`
+	NSFW            *bool    `url:"nsfw,omitempty"`
+	SupportsGen     *bool    `url:"supportsGeneration,omitempty"`
+	FromPlatform    *bool    `url:"fromPlatform,omitempty"`
+	EarlyAccess     *bool    `url:"earlyAccess,omitempty"`
+	PrimaryFileOnly *bool    `url:"primaryFileOnly,omitempty"`
+	Favorites       *bool    `url:"favorites,omitempty"`
+	Hidden          *bool    `url:"hidden,omitempty"`
 }
 
-func (m *ModelRequest) GetQuery() string {
-	return buildQuery(m)
-}
-
-func (m *ModelRequest) ToMap() map[string]interface{} {
-	result := make(map[string]interface{})
-
-	v := reflect.ValueOf(m).Elem()
-	t := reflect.TypeOf(m).Elem()
-
-	for i := 0; i < v.NumField(); i++ {
-		field := v.Field(i)
-		typeField := t.Field(i)
-
-		// Get the tag for the field
-		tag := typeField.Tag.Get("url")
-		if tag == "" {
-			continue
-		}
-
-		// Parse tag options
-		tagParts := strings.Split(tag, ",")
-		key := tagParts[0]
-		hasOmitempty := false
-		for _, part := range tagParts[1:] {
-			if part == "omitempty" {
-				hasOmitempty = true
-			}
-		}
-
-		if key == "" {
-			key = strings.ToLower(typeField.Name)
-		}
-
-		// Skip if field is zero value and omitempty is set
-		if hasOmitempty {
-			if field.Kind() == reflect.Ptr && field.IsNil() {
-				continue
-			} else if field.Kind() == reflect.Slice && field.Len() == 0 {
-				continue
-			} else if field.Kind() != reflect.Ptr && field.Kind() != reflect.Slice && field.IsZero() {
-				continue
-			}
-		}
-
-		// Handle different field types
-		if field.Kind() == reflect.Ptr && !field.IsNil() {
-			// Dereference pointer and convert to string
-			elem := field.Elem()
-			switch elem.Kind() {
-			case reflect.String:
-				result[key] = elem.String()
-			case reflect.Int, reflect.Int32, reflect.Int64:
-				result[key] = strconv.FormatInt(elem.Int(), 10)
-			case reflect.Bool:
-				result[key] = strconv.FormatBool(elem.Bool())
-			}
-		} else if field.Kind() == reflect.Slice {
-			// Handle slice types
-			if field.Len() > 0 {
-				if strings.Contains(tag, "comma") {
-					// Comma-separated values
-					var values []string
-					for j := 0; j < field.Len(); j++ {
-						elem := field.Index(j)
-						switch elem.Kind() {
-						case reflect.String:
-							values = append(values, elem.String())
-						case reflect.Int, reflect.Int32, reflect.Int64:
-							values = append(values, strconv.FormatInt(elem.Int(), 10))
-						}
-					}
-					result[key] = strings.Join(values, ",")
-				} else {
-					// For non-comma slices, we return the slice as is
-					var values []interface{}
-					for j := 0; j < field.Len(); j++ {
-						elem := field.Index(j)
-						switch elem.Kind() {
-						case reflect.String:
-							values = append(values, elem.String())
-						case reflect.Int, reflect.Int32, reflect.Int64:
-							values = append(values, strconv.FormatInt(elem.Int(), 10))
-						}
-					}
-					result[key] = values
-				}
-			}
-		} else if field.Kind() != reflect.Ptr {
-			// Handle non-pointer values
-			switch field.Kind() {
-			case reflect.String:
-				result[key] = field.String()
-			case reflect.Int, reflect.Int32, reflect.Int64:
-				result[key] = strconv.FormatInt(field.Int(), 10)
-			case reflect.Bool:
-				result[key] = strconv.FormatBool(field.Bool())
-			}
-		}
+func (r *ModelRequest) add(p url.Values) {
+	if r == nil {
+		return
 	}
-
-	return result
+	intPtr(p, "limit", r.Limit)
+	intPtr(p, "page", r.Page)
+	strPtr(p, "cursor", r.Cursor)
+	strPtr(p, "query", r.Query)
+	intsJoin(p, "ids", r.IDs)
+	strPtr(p, "tag", r.Tag)
+	strPtr(p, "username", r.Username)
+	strsJoin(p, "types", r.Types)
+	strsJoin(p, "baseModels", r.BaseModels)
+	strPtr(p, "checkpointType", r.CheckpointType)
+	strPtr(p, "sort", r.Sort)
+	strPtr(p, "period", r.Period)
+	boolPtr(p, "nsfw", r.NSFW)
+	boolPtr(p, "supportsGeneration", r.SupportsGen)
+	boolPtr(p, "fromPlatform", r.FromPlatform)
+	boolPtr(p, "earlyAccess", r.EarlyAccess)
+	boolPtr(p, "primaryFileOnly", r.PrimaryFileOnly)
+	boolPtr(p, "favorites", r.Favorites)
+	boolPtr(p, "hidden", r.Hidden)
 }
 
-// buildQuery builds a query string from a struct using URL tags
-func buildQuery(req interface{}) string {
-	v := reflect.ValueOf(req)
-	if v.Kind() == reflect.Ptr {
-		v = v.Elem()
+func (r *ModelRequest) QueryString() string {
+	p := url.Values{}
+	r.add(p)
+	s := p.Encode()
+	if s == "" {
+		return ""
 	}
-	t := v.Type()
+	return "?" + s
+}
 
-	params := url.Values{}
+func (r *ModelRequest) GetQuery() string { return r.QueryString() }
 
-	for i := 0; i < v.NumField(); i++ {
-		field := v.Field(i)
-		typeField := t.Field(i)
-
-		// Get the tag for the field
-		tag := typeField.Tag.Get("url")
-		if tag == "" {
-			continue
-		}
-
-		// Parse tag options
-		tagParts := strings.Split(tag, ",")
-		key := tagParts[0]
-		hasOmitempty := false
-		hasComma := false
-		for _, part := range tagParts[1:] {
-			if part == "omitempty" {
-				hasOmitempty = true
-			} else if part == "comma" {
-				hasComma = true
-			}
-		}
-
-		if key == "" {
-			key = strings.ToLower(typeField.Name)
-		}
-
-		// Skip if field is zero value and omitempty is set
-		if hasOmitempty {
-			if field.Kind() == reflect.Ptr && field.IsNil() {
-				continue
-			} else if field.Kind() == reflect.Slice && field.Len() == 0 {
-				continue
-			} else if field.Kind() != reflect.Ptr && field.Kind() != reflect.Slice && field.IsZero() {
-				continue
-			}
-		}
-
-		// Handle different field types
-		if field.Kind() == reflect.Ptr && !field.IsNil() {
-			// Dereference pointer and convert to string
-			elem := field.Elem()
-			var value string
-			switch elem.Kind() {
-			case reflect.String:
-				value = elem.String()
-			case reflect.Int, reflect.Int32, reflect.Int64:
-				value = strconv.FormatInt(elem.Int(), 10)
-			case reflect.Bool:
-				value = strconv.FormatBool(elem.Bool())
-			default:
-				continue
-			}
-			params.Add(key, value)
-		} else if field.Kind() == reflect.Slice {
-			// Handle slice types
-			if field.Len() > 0 {
-				if hasComma {
-					// Comma-separated values
-					var values []string
-					for j := 0; j < field.Len(); j++ {
-						elem := field.Index(j)
-						var elemValue string
-						switch elem.Kind() {
-						case reflect.String:
-							elemValue = elem.String()
-						case reflect.Int, reflect.Int32, reflect.Int64:
-							elemValue = strconv.FormatInt(elem.Int(), 10)
-						default:
-							continue
-						}
-						values = append(values, elemValue)
-					}
-					if len(values) > 0 {
-						params.Add(key, strings.Join(values, ","))
-					}
-				} else {
-					// Multiple values with the same key
-					for j := 0; j < field.Len(); j++ {
-						elem := field.Index(j)
-						var elemValue string
-						switch elem.Kind() {
-						case reflect.String:
-							elemValue = elem.String()
-						case reflect.Int, reflect.Int32, reflect.Int64:
-							elemValue = strconv.FormatInt(elem.Int(), 10)
-						default:
-							continue
-						}
-						params.Add(key, elemValue)
-					}
-				}
-			}
-		} else if field.Kind() != reflect.Ptr {
-			// Handle non-pointer values
-			var value string
-			switch field.Kind() {
-			case reflect.String:
-				value = field.String()
-			case reflect.Int, reflect.Int32, reflect.Int64:
-				value = strconv.FormatInt(field.Int(), 10)
-			case reflect.Bool:
-				value = strconv.FormatBool(field.Bool())
-			default:
-				continue
-			}
-			params.Add(key, value)
-		}
+func (r *ModelRequest) ToMap() map[string]interface{} {
+	m := make(map[string]interface{})
+	if r == nil {
+		return m
 	}
-
-	return params.Encode()
+	if r.Limit != nil {
+		m["limit"] = strconv.Itoa(*r.Limit)
+	}
+	if r.Page != nil {
+		m["page"] = strconv.Itoa(*r.Page)
+	}
+	if r.Cursor != nil {
+		m["cursor"] = *r.Cursor
+	}
+	if r.Query != nil {
+		m["query"] = *r.Query
+	}
+	if len(r.IDs) > 0 {
+		m["ids"] = intsToStr(r.IDs)
+	}
+	if r.Tag != nil {
+		m["tag"] = *r.Tag
+	}
+	if r.Username != nil {
+		m["username"] = *r.Username
+	}
+	if len(r.Types) > 0 {
+		m["types"] = strings.Join(r.Types, ",")
+	}
+	if len(r.BaseModels) > 0 {
+		m["baseModels"] = strings.Join(r.BaseModels, ",")
+	}
+	if r.CheckpointType != nil {
+		m["checkpointType"] = *r.CheckpointType
+	}
+	if r.Sort != nil {
+		m["sort"] = *r.Sort
+	}
+	if r.Period != nil {
+		m["period"] = *r.Period
+	}
+	if r.NSFW != nil {
+		m["nsfw"] = strconv.FormatBool(*r.NSFW)
+	}
+	if r.SupportsGen != nil {
+		m["supportsGeneration"] = strconv.FormatBool(*r.SupportsGen)
+	}
+	if r.FromPlatform != nil {
+		m["fromPlatform"] = strconv.FormatBool(*r.FromPlatform)
+	}
+	if r.EarlyAccess != nil {
+		m["earlyAccess"] = strconv.FormatBool(*r.EarlyAccess)
+	}
+	if r.PrimaryFileOnly != nil {
+		m["primaryFileOnly"] = strconv.FormatBool(*r.PrimaryFileOnly)
+	}
+	if r.Favorites != nil {
+		m["favorites"] = strconv.FormatBool(*r.Favorites)
+	}
+	if r.Hidden != nil {
+		m["hidden"] = strconv.FormatBool(*r.Hidden)
+	}
+	return m
 }
 
-// ModelResponse represents the entire JSON response from the GET /api/v1/models endpoint.
-type ModelResponse struct {
-	ID            int64          `json:"id"`
-	Name          string         `json:"name"`
-	Description   string         `json:"description"`
-	Type          string         `json:"type"`
-	NSFW          bool           `json:"nsfw"`
-	Tags          []string       `json:"tags"`
-	Mode          *string        `json:"mode"`
-	Creator       Creator        `json:"creator"`
-	Stats         Stats          `json:"stats"`
-	ModelVersions []ModelVersion `json:"modelVersions"`
-	Metadata      Metadata       `json:"metadata"`
+// ── Helpers ────────────────────────────────────────
+
+func intPtr(p url.Values, k string, v *int) {
+	if v != nil {
+		p.Set(k, strconv.Itoa(*v))
+	}
 }
 
-// Creator contains information about the model's creator.
-
-// Stats contains statistics about the model.
-type Stats struct {
-	DownloadCount int64   `json:"downloadCount"`
-	FavoriteCount int64   `json:"favoriteCount"`
-	CommentCount  int64   `json:"commentCount"`
-	RatingCount   int64   `json:"ratingCount"`
-	Rating        float64 `json:"rating"`
+func strPtr(p url.Values, k string, v *string) {
+	if v != nil {
+		p.Set(k, *v)
+	}
 }
 
-// ModelVersion represents a specific version of the model.
-type ModelVersion struct {
-	ID           int64             `json:"id"`
-	Name         string            `json:"name"`
-	Description  string            `json:"description"`
-	CreatedAt    time.Time         `json:"createdAt" time_format:"2006-01-02T15:04:05Z07:00"`
-	DownloadURL  string            `json:"downloadUrl"`
-	TrainedWords []string          `json:"trainedWords"`
-	Files        []File            `json:"files"`
-	Images       []Image           `json:"images"`
-	Stats        ModelVersionStats `json:"stats"`
+func boolPtr(p url.Values, k string, v *bool) {
+	if v != nil {
+		p.Set(k, strconv.FormatBool(*v))
+	}
 }
 
-// File represents a file associated with a model version.
+func intsJoin(p url.Values, k string, v []int) {
+	if len(v) > 0 {
+		p.Set(k, intsToStr(v))
+	}
+}
+
+func strsJoin(p url.Values, k string, v []string) {
+	if len(v) > 0 {
+		p.Set(k, strings.Join(v, ","))
+	}
+}
+
+func intsToStr(v []int) string {
+	var b strings.Builder
+	for i, n := range v {
+		if i > 0 {
+			b.WriteByte(',')
+		}
+		b.WriteString(strconv.Itoa(n))
+	}
+	return b.String()
+}
+
+// ── Response: GET /api/v1/models ────────────────────
+
+type ModelsResponse struct {
+	Items    []ModelItem `json:"items"`
+	Metadata *Metadata   `json:"metadata,omitempty"`
+}
+
+// ── Model item (list & GET /models/{id}) ────────────
+
+type ModelItem struct {
+	ID                    int                    `json:"id"`
+	Name                  string                 `json:"name"`
+	Description           string                 `json:"description"`
+	Type                  string                 `json:"type"`
+	NSFW                  bool                   `json:"nsfw"`
+	NSFWLevel             int                    `json:"nsfwLevel"`
+	Availability          string                 `json:"availability"`
+	SupportsGeneration    bool                   `json:"supportsGeneration"`
+	AllowNoCredit         bool                   `json:"allowNoCredit"`
+	AllowCommercialUse    string                 `json:"allowCommercialUse"`
+	AllowDerivatives      bool                   `json:"allowDerivatives"`
+	AllowDifferentLicense bool                   `json:"allowDifferentLicense"`
+	Minor                 bool                   `json:"minor"`
+	POI                   bool                   `json:"poi"`
+	SFWOnly               bool                   `json:"sfwOnly"`
+	Mode                  *string                `json:"mode"`
+	Stats                 *ModelStats            `json:"stats,omitempty"`
+	Creator               *Creator               `json:"creator,omitempty"`
+	Tags                  []string               `json:"tags"`
+	ModelVersions         []ModelVersionCompact  `json:"modelVersions"`
+}
+
+// ── Compact model version (inside list) ─────────────
+
+type ModelVersionCompact struct {
+	ID                 int           `json:"id"`
+	Name               string        `json:"name"`
+	BaseModel          string        `json:"baseModel"`
+	BaseModelType      string        `json:"baseModelType"`
+	PublishedAt        *time.Time    `json:"publishedAt"`
+	SupportsGeneration bool          `json:"supportsGeneration"`
+	Stats              *VersionStats `json:"stats,omitempty"`
+	Files              []File        `json:"files"`
+	Images             []Image       `json:"images"`
+	DownloadURL        string        `json:"downloadUrl"`
+}
+
+// ── File ────────────────────────────────────────────
+
 type File struct {
-	SizeKb           float64       `json:"sizeKb"`
+	ID               int           `json:"id"`
+	Name             string        `json:"name"`
+	Type             string        `json:"type"`
+	SizeKB           float64       `json:"sizeKB"`
+	Metadata         *FileMetadata `json:"metadata,omitempty"`
 	PickleScanResult string        `json:"pickleScanResult"`
 	VirusScanResult  string        `json:"virusScanResult"`
-	ScannedAt        *time.Time    `json:"scannedAt" time_format:"2006-01-02T15:04:05Z07:00"`
-	Primary          *bool         `json:"primary"`
-	Metadata         *FileMetadata `json:"metadata"`
+	Hashes           *FileHashes   `json:"hashes,omitempty"`
+	DownloadURL      string        `json:"downloadUrl"`
+	Primary          bool          `json:"primary"`
 }
 
-// FileMetadata contains metadata about a model file.
+type FileHashes struct {
+	AutoV1 string `json:"AutoV1,omitempty"`
+	AutoV2 string `json:"AutoV2,omitempty"`
+	AutoV3 string `json:"AutoV3,omitempty"`
+	SHA256 string `json:"SHA256,omitempty"`
+	CRC32  string `json:"CRC32,omitempty"`
+	BLAKE3 string `json:"BLAKE3,omitempty"`
+}
+
 type FileMetadata struct {
-	FP     *string `json:"fp"`
+	Format string  `json:"format,omitempty"`
 	Size   *string `json:"size"`
-	Format *string `json:"format"`
+	FP     *string `json:"fp"`
 }
 
-// Image represents an image associated with a model version.
+// ── Image ───────────────────────────────────────────
+
 type Image struct {
-	ID     string                  `json:"id"`
-	URL    string                  `json:"url"`
-	NSFW   string                  `json:"nsfw"`
-	Width  int64                   `json:"width"`
-	Height int64                   `json:"height"`
-	Hash   string                  `json:"hash"`
-	Meta   *map[string]interface{} `json:"meta"`
+	ID     int    `json:"id"`
+	URL    string `json:"url"`
+	NSFW   string `json:"nsfw"`
+	Width  int    `json:"width"`
+	Height int    `json:"height"`
+	Hash   string `json:"hash"`
+	Type   string `json:"type"`
 }
 
-// ModelVersionStats contains statistics specific to a model version.
-type ModelVersionStats struct {
-	DownloadCount int64   `json:"downloadCount"`
-	RatingCount   int64   `json:"ratingCount"`
-	Rating        float64 `json:"rating"`
+// ── Creator ─────────────────────────────────────────
+
+type Creator struct {
+	Username string  `json:"username"`
+	Image    *string `json:"image"`
 }
 
-// Metadata contains pagination information for the response.
+// ── Stats ───────────────────────────────────────────
+
+type ModelStats struct {
+	DownloadCount     int `json:"downloadCount"`
+	ThumbsUpCount     int `json:"thumbsUpCount"`
+	ThumbsDownCount   int `json:"thumbsDownCount"`
+	CommentCount      int `json:"commentCount"`
+	TippedAmountCount int `json:"tippedAmountCount"`
+}
+
+type VersionStats struct {
+	DownloadCount   int `json:"downloadCount"`
+	ThumbsUpCount   int `json:"thumbsUpCount"`
+	ThumbsDownCount int `json:"thumbsDownCount"`
+}
+
+// ── Metadata (pagination) ──────────────────────────
+
 type Metadata struct {
-	TotalItems  int     `json:"totalItems,string"`
-	CurrentPage int     `json:"currentPage,string"`
-	PageSize    int     `json:"pageSize,string"`
-	TotalPages  int     `json:"totalPages,string"`
-	NextPage    *string `json:"nextPage"`
-	PrevPage    *string `json:"prevPage"`
+	NextCursor  string `json:"nextCursor,omitempty"`
+	NextPage    string `json:"nextPage,omitempty"`
+	CurrentPage int    `json:"currentPage,omitempty"`
+	PageSize    int    `json:"pageSize,omitempty"`
 }
+
+// ── Model info (nested in full version) ─────────────
+
+type ModelInfo struct {
+	Name string  `json:"name"`
+	Type string  `json:"type"`
+	NSFW bool    `json:"nsfw"`
+	POI  bool    `json:"poi"`
+	Mode *string `json:"mode"`
+}
+
+// ── Enums ──────────────────────────────────────────
+
+type EnumsResponse struct {
+	ModelType       []string `json:"ModelType"`
+	ModelFileType   []string `json:"ModelFileType"`
+	ActiveBaseModel []string `json:"ActiveBaseModel"`
+	BaseModel       []string `json:"BaseModel"`
+	BaseModelType   []string `json:"BaseModelType"`
+}
+
+// ── Compat aliases ──────────────────────────────────
+
+type ModelResponse = ModelsResponse
+type ModelIdResponse = ModelItem

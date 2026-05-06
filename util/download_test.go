@@ -1,15 +1,44 @@
 package util
 
-import "testing"
+import (
+	"os"
+	"path/filepath"
+	"testing"
+)
 
-func TestDownloadFile(t *testing.T) {
-	url := "http://data.server.poyuan233.cn:8088/data/mm.m"
-	fileSize, err := getFileSize(url)
+func TestCreateFile(t *testing.T) {
+	dir := t.TempDir()
+	p := filepath.Join(dir, "sub", "test.txt")
+	f, err := CreateFile(p)
 	if err != nil {
-		panic(err)
+		t.Fatal(err)
 	}
-	err = StartDownloadFile(url, "miaomiaoRealskin_epsV13.safetensors", fileSize, 8, 1024*1024*1024)
+	f.Close()
+	if !FileExists(p) {
+		t.Fatal("file should exist")
+	}
+}
+
+func TestFileExists(t *testing.T) {
+	if FileExists("/nonexistent/path/12345") {
+		t.Fatal("should not exist")
+	}
+}
+
+func TestPreallocateFile(t *testing.T) {
+	dir := t.TempDir()
+	p := filepath.Join(dir, "prealloc.bin")
+	f, err := os.Create(p)
 	if err != nil {
-		panic(err)
+		t.Fatal(err)
+	}
+	defer f.Close()
+
+	if err := PreallocateFile(f, 4096); err != nil {
+		t.Fatal(err)
+	}
+	fi, _ := f.Stat()
+	if fi.Size() != 4096 {
+		t.Fatalf("expected 4096, got %d", fi.Size())
 	}
 }
