@@ -1,25 +1,35 @@
 package api
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
+	"time"
 
 	"civitai-model-downloader/dto"
 	"civitai-model-downloader/util"
 )
 
-const baseURL = "https://civitai.com"
+const (
+	baseURL        = "https://civitai.com"
+	requestTimeout = 30 * time.Second
+)
 
-func doGet(url string) ([]byte, error) {
-	req, err := http.NewRequest("GET", url, nil)
+func doGet(ctx context.Context, url string) ([]byte, error) {
+	ctx, cancel := context.WithTimeout(ctx, requestTimeout)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
 	if err != nil {
 		return nil, err
 	}
 	if util.AuthHeader != nil {
-		for k, v := range util.AuthHeader {
-			req.Header.Set(k, v)
+		if v := util.AuthHeader["Authorization"]; v != "" && v != "Bearer " {
+			for k, v := range util.AuthHeader {
+				req.Header.Set(k, v)
+			}
 		}
 	}
 	req.Header.Set("User-Agent", "cvtcli/2.0")
@@ -44,9 +54,12 @@ func doGet(url string) ([]byte, error) {
 	return data, nil
 }
 
-func GetModelInfo(req *dto.ModelRequest) (*dto.ModelsResponse, error) {
+func GetModelInfo(ctx context.Context, req *dto.ModelRequest) (*dto.ModelsResponse, error) {
+	if req == nil {
+		req = &dto.ModelRequest{}
+	}
 	u := baseURL + "/api/v1/models" + req.QueryString()
-	data, err := doGet(u)
+	data, err := doGet(ctx, u)
 	if err != nil {
 		return nil, err
 	}
@@ -57,9 +70,9 @@ func GetModelInfo(req *dto.ModelRequest) (*dto.ModelsResponse, error) {
 	return &resp, nil
 }
 
-func GetModelById(modelId string) (*dto.ModelItem, error) {
+func GetModelById(ctx context.Context, modelId string) (*dto.ModelItem, error) {
 	u := baseURL + "/api/v1/models/" + modelId
-	data, err := doGet(u)
+	data, err := doGet(ctx, u)
 	if err != nil {
 		return nil, err
 	}
@@ -70,9 +83,9 @@ func GetModelById(modelId string) (*dto.ModelItem, error) {
 	return &model, nil
 }
 
-func GetModelByVersionId(versionId string) (*dto.ModelVersionFull, error) {
+func GetModelByVersionId(ctx context.Context, versionId string) (*dto.ModelVersionFull, error) {
 	u := baseURL + "/api/v1/model-versions/" + versionId
-	data, err := doGet(u)
+	data, err := doGet(ctx, u)
 	if err != nil {
 		return nil, err
 	}
@@ -83,9 +96,9 @@ func GetModelByVersionId(versionId string) (*dto.ModelVersionFull, error) {
 	return &model, nil
 }
 
-func GetModelByHash(hash string) (*dto.ModelVersionFull, error) {
+func GetModelByHash(ctx context.Context, hash string) (*dto.ModelVersionFull, error) {
 	u := baseURL + "/api/v1/model-versions/by-hash/" + hash
-	data, err := doGet(u)
+	data, err := doGet(ctx, u)
 	if err != nil {
 		return nil, err
 	}

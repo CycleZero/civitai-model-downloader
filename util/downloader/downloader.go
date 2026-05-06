@@ -127,12 +127,10 @@ func (d *Downloader) Download(ctx context.Context) (err error) {
 		return fmt.Errorf("segments: %w", err)
 	}
 
-	offsets := make([]int64, len(segs))
-	var resumeState *State
 	if d.config.Resume && fileSize > 0 {
-		resumeState = findResumableState(d.url, d.output)
+		resumeState := findResumableState(d.url, d.output)
 		if resumeState != nil && resumeState.TotalSize == fileSize && len(resumeState.Segments) == len(segs) {
-			offsets = d.applyResume(segs, resumeState)
+			d.applyResume(segs, resumeState)
 		}
 	}
 
@@ -149,6 +147,7 @@ func (d *Downloader) Download(ctx context.Context) (err error) {
 		for p := range progCh {
 			pb.Update(p)
 		}
+		fmt.Fprintln(os.Stderr)
 	}()
 
 	ctx, cancel := context.WithCancel(ctx)
@@ -164,9 +163,9 @@ func (d *Downloader) Download(ctx context.Context) (err error) {
 		if segs[i].TempPath == "" {
 			segs[i].TempPath = tempPath(d.url, d.output, i)
 		}
-		go func(seg *Segment, idx int, off int64) {
-			resultCh <- result{idx, d.downloadSegment(ctx, seg, off, fileSize, progCh)}
-		}(&segs[i], i, offsets[i])
+		go func(seg *Segment, idx int) {
+			resultCh <- result{idx, d.downloadSegment(ctx, seg, fileSize, progCh)}
+		}(&segs[i], i)
 	}
 
 	results := make([]result, len(segs))
@@ -303,8 +302,7 @@ func (d *Downloader) segments(fileSize int64, supportsRange bool) ([]Segment, er
 	return segs, nil
 }
 
-func (d *Downloader) applyResume(segs []Segment, state *State) []int64 {
-	offsets := make([]int64, len(segs))
+func (d *Downloader) applyResume(segs []Segment, state *State) {
 	for i := range segs {
 		if i >= len(state.Segments) {
 			continue
@@ -312,15 +310,10 @@ func (d *Downloader) applyResume(segs []Segment, state *State) []int64 {
 		rs := state.Segments[i]
 		segs[i].TempPath = rs.TempPath
 		segs[i].DownloadedBytes = rs.DownloadedBytes
-		if rs.DownloadedBytes > 0 && segs[i].Start+rs.DownloadedBytes <= segs[i].End+1 {
-			segs[i].Start += rs.DownloadedBytes
-			offsets[i] = rs.DownloadedBytes
-		}
 	}
-	return offsets
 }
 
-func (d *Downloader) downloadSegment(ctx context.Context, seg *Segment, offset int64, totalSize int64, progCh chan<- Progress) error {
+func (d *Downloader) downloadSegment(ctx context.Context, seg *Segment, totalSize int64, progCh chan<- Progress) error {
 	attempt := 0
 	var lastErr error
 

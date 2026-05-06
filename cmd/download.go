@@ -3,9 +3,11 @@ package cmd
 import (
 	"context"
 	"fmt"
+	"mime"
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"syscall"
 
@@ -18,71 +20,74 @@ import (
 )
 
 var (
-	DownloadUrl     string
-	ModelId         string
-	ModelVersionId  string
-	ModelName       string
-	ModelHash       string
-	DownloadDir     string
-	NumThreads      int
-	MaxChunkSize    int64
+	flagUrl       string
+	flagModelId   string
+	flagVersionId string
+	flagHash      string
+	flagOutputDir string
+	flagThreads   int
+	flagChunkSize int64
 )
 
 var downloadCommand = &cobra.Command{
 	Use: "download",
 	Run: func(cmd *cobra.Command, args []string) {
-		if DownloadDir == "" {
-			DownloadDir = "."
+		var (
+			downloadUrl string
+			modelName   string
+		)
+		outputDir := flagOutputDir
+		if outputDir == "" {
+			outputDir = "."
 		}
 
-		if DownloadUrl != "" {
-			if ModelName == "" {
-				var err error
-				ModelName, err = resolveFilename(DownloadUrl)
-				if err != nil {
-					log.Logger().Sugar().Errorf("resolve filename: %v", err)
-					return
-				}
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+
+		switch {
+		case flagUrl != "":
+			downloadUrl = flagUrl
+			var err error
+			modelName, err = resolveFilename(downloadUrl)
+			if err != nil {
+				log.Logger().Sugar().Errorf("resolve filename: %v", err)
+				return
 			}
-		} else if ModelHash != "" {
-			model, err := api.GetModelByHash(ModelHash)
+		case flagHash != "":
+			model, err := api.GetModelByHash(ctx, flagHash)
 			if err != nil {
 				log.Logger().Sugar().Errorf("api: %v", err)
 				return
 			}
-			DownloadUrl = model.DownloadURL
-			if ModelName == "" {
-				var err error
-				ModelName, err = resolveFilename(DownloadUrl)
-				if err != nil && len(model.Files) > 0 && model.Files[0].Name != "" {
-					ModelName = model.Files[0].Name
-				} else if err != nil {
-					log.Logger().Sugar().Errorf("resolve filename: %v", err)
-					return
-				}
+			downloadUrl = model.DownloadURL
+			modelName, err = resolveFilename(downloadUrl)
+			if err != nil && len(model.Files) > 0 && model.Files[0].Name != "" {
+				modelName = model.Files[0].Name
+			} else if err != nil {
+				log.Logger().Sugar().Errorf("resolve filename: %v", err)
+				return
 			}
-		} else if ModelVersionId != "" {
-			model, err := api.GetModelByVersionId(ModelVersionId)
+		case flagVersionId != "":
+			model, err := api.GetModelByVersionId(ctx, flagVersionId)
 			if err != nil {
 				log.Logger().Sugar().Errorf("api: %v", err)
 				return
 			}
-			ModelName = model.Name
-			DownloadUrl = model.DownloadURL
-		} else if ModelId != "" {
+			downloadUrl = model.DownloadURL
+			modelName = model.Name
+		case flagModelId != "":
 			log.Logger().Error("model-id download not yet implemented, use --hash or --modelVersionId")
 			return
-		} else {
+		default:
 			log.Logger().Error("specify --url, --hash, --modelVersionId, or --modelId")
 			return
 		}
 
-		outPath := DownloadDir + "/" + ModelName
-
-		log.Logger().Sugar().Infof("downloading %s -> %s", DownloadUrl, outPath)
+		outPath := filepath.Join(outputDir, modelName)
+		log.Logger().Sugar().Infof("downloading %s -> %s", downloadUrl, outPath)
 
 		cfg := &downloader.Config{
-			Concurrency: NumThreads,
+			Concurrency: flagThreads,
 			MaxRetries:  3,
 			HTTPTimeout: 0,
 			Headers:     util.AuthHeader,
@@ -90,10 +95,6 @@ var downloadCommand = &cobra.Command{
 			Logger:      log.Logger(),
 		}
 
-		ctx, cancel := context.WithCancel(context.Background())
-		defer cancel()
-
-		// graceful shutdown on SIGINT/SIGTERM
 		sigCh := make(chan os.Signal, 1)
 		signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
 		go func() {
@@ -102,8 +103,12 @@ var downloadCommand = &cobra.Command{
 			cancel()
 		}()
 
-		dl := downloader.New(DownloadUrl, outPath, cfg)
-		if err := dl.Download(ctx); err != nil {
+		dl := downloader.New(downloadUrl, outPath, cfg)
+		err := dl.Download(ctx)
+		signal.Stop(sigCh)
+		close(sigCh)
+
+		if err != nil {
 			log.Logger().Sugar().Errorf("download: %v", err)
 			return
 		}
@@ -129,28 +134,115 @@ func resolveFilename(url string) (string, error) {
 	defer resp.Body.Close()
 
 	cd := resp.Header.Get("Content-Disposition")
-	idx := strings.Index(cd, "filename=")
+	if cd == "" {
+		return "", fmt.Errorf("no Content-Disposition header")
+	}
+
+	if name := parseRFC5987(cd); name != "" {
+		return name, nil
+	}
+
+	if name := parseSimpleFilename(cd); name != "" {
+		return name, nil
+	}
+
+	return "", fmt.Errorf("cannot parse filename from Content-Disposition: %s", cd)
+}
+
+func parseSimpleFilename(cd string) string {
+	_, params, err := mime.ParseMediaType(cd)
+	if err != nil {
+		idx := strings.Index(cd, "filename=")
+		if idx < 0 {
+			return ""
+		}
+		f := cd[idx+9:]
+		f = strings.Trim(f, `"`)
+		if i := strings.IndexByte(f, ';'); i > 0 {
+			f = f[:i]
+		}
+		return f
+	}
+	return params["filename"]
+}
+
+func parseRFC5987(cd string) string {
+	idx := strings.Index(cd, "filename*=")
 	if idx < 0 {
-		return "", fmt.Errorf("no filename in Content-Disposition: %s", cd)
+		return ""
 	}
-	f := cd[idx+9:]
-	f = strings.Trim(f, `"`)
-	if idx2 := strings.Index(f, `";`); idx2 > 0 {
-		f = f[:idx2]
+	rest := cd[idx+10:]
+	end := strings.IndexByte(rest, ';')
+	if end > 0 {
+		rest = rest[:end]
 	}
-	if f == "" {
-		return "", fmt.Errorf("empty filename")
+	rest = strings.Trim(rest, `"`)
+
+	encEnd := strings.IndexByte(rest, '\'')
+	if encEnd < 0 {
+		return ""
 	}
-	return f, nil
+	langEnd := strings.IndexByte(rest[encEnd+1:], '\'')
+	if langEnd < 0 {
+		return ""
+	}
+	encoded := rest[encEnd+langEnd+2:]
+	encoding := strings.ToLower(rest[:encEnd])
+
+	var decoded string
+	switch encoding {
+	case "utf-8":
+		var err error
+		decoded, err = urlDecode(encoded)
+		if err != nil {
+			return ""
+		}
+	default:
+		return ""
+	}
+	return decoded
+}
+
+func urlDecode(s string) (string, error) {
+	var buf strings.Builder
+	for i := 0; i < len(s); i++ {
+		switch {
+		case s[i] == '%' && i+2 < len(s):
+			hi, lo := unhex(s[i+1]), unhex(s[i+2])
+			if hi < 0 || lo < 0 {
+				buf.WriteByte(s[i])
+			} else {
+				buf.WriteByte(byte(hi<<4) | byte(lo))
+				i += 2
+			}
+		case s[i] == '+':
+			buf.WriteByte(' ')
+		default:
+			buf.WriteByte(s[i])
+		}
+	}
+	return buf.String(), nil
+}
+
+func unhex(c byte) int {
+	switch {
+	case '0' <= c && c <= '9':
+		return int(c - '0')
+	case 'a' <= c && c <= 'f':
+		return int(c - 'a' + 10)
+	case 'A' <= c && c <= 'F':
+		return int(c - 'A' + 10)
+	}
+	return -1
 }
 
 func init() {
-	downloadCommand.PersistentFlags().StringVarP(&DownloadUrl, "url", "u", "", "direct download URL")
-	downloadCommand.PersistentFlags().StringVarP(&ModelId, "modelId", "m", "", "model ID")
-	downloadCommand.PersistentFlags().StringVar(&ModelHash, "hash", "", "model hash")
-	downloadCommand.PersistentFlags().StringVarP(&DownloadDir, "downloadDir", "o", "", "output directory")
-	downloadCommand.PersistentFlags().StringVarP(&ModelVersionId, "modelVersionId", "v", "", "model version ID")
-	downloadCommand.PersistentFlags().IntVarP(&NumThreads, "numThreads", "t", 8, "number of concurrent download threads")
-	downloadCommand.PersistentFlags().Int64VarP(&MaxChunkSize, "maxChunkSize", "s", 1024*1024*1024, "max chunk size (unused, kept for compat)")
+	downloadCommand.PersistentFlags().StringVarP(&flagUrl, "url", "u", "", "direct download URL")
+	downloadCommand.PersistentFlags().StringVarP(&flagModelId, "modelId", "m", "", "model ID")
+	downloadCommand.PersistentFlags().StringVar(&flagHash, "hash", "", "model hash")
+	downloadCommand.PersistentFlags().StringVarP(&flagOutputDir, "downloadDir", "o", "", "output directory")
+	downloadCommand.PersistentFlags().StringVarP(&flagVersionId, "modelVersionId", "v", "", "model version ID")
+	downloadCommand.PersistentFlags().IntVarP(&flagThreads, "numThreads", "t", 8, "number of concurrent download threads")
+	downloadCommand.PersistentFlags().Int64VarP(&flagChunkSize, "maxChunkSize", "s", 1024*1024*1024, "max chunk size (unused, kept for compat)")
 	rootCmd.AddCommand(downloadCommand)
 }

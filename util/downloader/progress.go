@@ -103,11 +103,6 @@ func (pb *ProgressBar) Update(p Progress) {
 	pb.render()
 }
 
-// AddDownloaded atomically adds to the total downloaded byte count.
-func (pb *ProgressBar) AddDownloaded(n int64) {
-	pb.downloaded.Add(n)
-}
-
 // GetDownloaded returns the total bytes downloaded so far.
 func (pb *ProgressBar) GetDownloaded() int64 {
 	return pb.downloaded.Load()
