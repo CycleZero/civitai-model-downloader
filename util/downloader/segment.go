@@ -43,6 +43,12 @@ func (s *Segment) Download(ctx context.Context, url string, client *http.Client,
 		}
 	}
 
+	if rangeLen > 0 && existingSize >= rangeLen {
+		s.DownloadedBytes = existingSize
+		emitProgress(progCh, s.Index, existingSize, rangeLen, true)
+		return nil
+	}
+
 	var file *os.File
 	var err error
 	if existingSize > 0 && startByte > s.Start {
