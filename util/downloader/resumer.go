@@ -67,11 +67,12 @@ func findResumableState(url, outputPath string) *State {
 		seg := &state.Segments[i]
 		fi, err := os.Stat(seg.TempPath)
 		if err != nil {
+			if os.IsNotExist(err) && seg.DownloadedBytes == 0 {
+				continue
+			}
 			return nil
 		}
-		if fi.Size() > 0 && seg.DownloadedBytes <= 0 {
-			seg.DownloadedBytes = fi.Size()
-		}
+		seg.DownloadedBytes = fi.Size()
 		segSize := seg.End - seg.Start + 1
 		if segSize > 0 && seg.DownloadedBytes > segSize {
 			return nil

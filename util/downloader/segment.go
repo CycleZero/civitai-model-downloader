@@ -122,10 +122,10 @@ func (s *Segment) Download(ctx context.Context, url string, client *http.Client,
 				return fmt.Errorf("short write: %d/%d", nw, nr)
 			}
 			written += int64(nw)
+			s.DownloadedBytes = existingSize + written
 
 			now := time.Now()
 			if progCh != nil && (now.Sub(lastReport) > 200*time.Millisecond || written%(1024*1024) < int64(nr)) {
-				s.DownloadedBytes = existingSize + written
 				emitProgress(progCh, s.Index, s.DownloadedBytes, totalForSegment, false)
 				lastReport = now
 			}

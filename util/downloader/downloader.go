@@ -5,7 +5,6 @@ import (
 	"crypto/sha256"
 	"crypto/tls"
 	"encoding/hex"
-	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -51,7 +50,7 @@ func (c *Config) norm() {
 	if c.RetryBackoffBase <= 0 {
 		c.RetryBackoffBase = defaultRetryBase
 	}
-	if c.HTTPTimeout <= 0 {
+	if c.HTTPTimeout < 0 {
 		c.HTTPTimeout = defaultHTTPTimeout
 	}
 	if c.Headers == nil {
@@ -78,7 +77,9 @@ func New(url, output string, cfg *Config) *Downloader {
 	tr := buildTransport(cfg)
 	client := &http.Client{
 		Transport: tr,
-		Timeout:   cfg.HTTPTimeout,
+	}
+	if cfg.HTTPTimeout > 0 {
+		client.Timeout = cfg.HTTPTimeout
 	}
 
 	logger := cfg.Logger
@@ -97,12 +98,13 @@ func New(url, output string, cfg *Config) *Downloader {
 
 func buildTransport(cfg *Config) *http.Transport {
 	tr := &http.Transport{
-		MaxIdleConns:        cfg.Concurrency + 4,
-		MaxIdleConnsPerHost: cfg.Concurrency + 2,
-		IdleConnTimeout:     90 * time.Second,
-		TLSHandshakeTimeout: 10 * time.Second,
-		DisableCompression:  false,
-		ForceAttemptHTTP2:   true,
+		MaxIdleConns:           cfg.Concurrency + 4,
+		MaxIdleConnsPerHost:    cfg.Concurrency + 2,
+		IdleConnTimeout:        90 * time.Second,
+		TLSHandshakeTimeout:    10 * time.Second,
+		ResponseHeaderTimeout:  30 * time.Second,
+		DisableCompression:     false,
+		ForceAttemptHTTP2:      true,
 	}
 
 	if cfg.ProxyURL != "" {
@@ -174,11 +176,19 @@ func (d *Downloader) Download(ctx context.Context) (err error) {
 		select {
 		case r := <-resultCh:
 			results[r.idx] = r
-			if r.err != nil {
-				cancel()
-			}
 			done++
 		case <-ctx.Done():
+			drainDeadline := time.After(500 * time.Millisecond)
+		drainLoop:
+			for done < len(segs) {
+				select {
+				case r := <-resultCh:
+					results[r.idx] = r
+					done++
+				case <-drainDeadline:
+					break drainLoop
+				}
+			}
 			d.saveState(segs, fileSize)
 			close(progCh)
 			<-progDone
@@ -334,8 +344,8 @@ func (d *Downloader) downloadSegment(ctx context.Context, seg *Segment, totalSiz
 		if err == nil {
 			return nil
 		}
-		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-			return err
+		if ctx.Err() != nil {
+			return ctx.Err()
 		}
 		lastErr = err
 		attempt++
