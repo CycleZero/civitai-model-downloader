@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 
@@ -20,13 +21,14 @@ import (
 )
 
 var (
-	flagUrl       string
-	flagModelId   string
-	flagVersionId string
-	flagHash      string
-	flagOutputDir string
-	flagThreads   int
-	flagChunkSize int64
+	flagUrl          string
+	flagModelId      string
+	flagVersionId    string
+	flagHash         string
+	flagOutputDir    string
+	flagThreads      int
+	flagChunkSizeStr string
+	flagMaxChunkSize int64
 )
 
 var downloadCommand = &cobra.Command{
@@ -88,6 +90,7 @@ var downloadCommand = &cobra.Command{
 
 		cfg := &downloader.Config{
 			Concurrency: flagThreads,
+			ChunkSize:   parseChunkSize(flagChunkSizeStr),
 			MaxRetries:  3,
 			HTTPTimeout: 0,
 			Headers:     util.AuthHeader,
@@ -243,6 +246,50 @@ func init() {
 	downloadCommand.PersistentFlags().StringVarP(&flagOutputDir, "downloadDir", "o", "", "output directory")
 	downloadCommand.PersistentFlags().StringVarP(&flagVersionId, "modelVersionId", "v", "", "model version ID")
 	downloadCommand.PersistentFlags().IntVarP(&flagThreads, "numThreads", "t", 8, "number of concurrent download threads")
-	downloadCommand.PersistentFlags().Int64VarP(&flagChunkSize, "maxChunkSize", "s", 1024*1024*1024, "max chunk size (unused, kept for compat)")
+	downloadCommand.PersistentFlags().StringVarP(&flagChunkSizeStr, "chunkSize", "c", "", "chunk size for dynamic worker pool (e.g. 16M, 1G, 16777216; empty=auto)")
+	downloadCommand.PersistentFlags().Int64VarP(&flagMaxChunkSize, "maxChunkSize", "s", 1024*1024*1024, "(deprecated, unused) kept for backward compatibility")
 	rootCmd.AddCommand(downloadCommand)
+}
+
+// parseChunkSize parses a human-friendly size string into bytes.
+// Accepts plain integers ("16777216"), or numbers with a unit
+// suffix: B, K/KB, M/MB, G/GB (case-insensitive). Returns 0 for an
+// empty string, which signals "auto-select" to the downloader.
+func parseChunkSize(s string) int64 {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return 0
+	}
+	if n, err := strconv.ParseInt(s, 10, 64); err == nil {
+		return n
+	}
+
+	numStr := s
+	unit := ""
+	for i, c := range s {
+		if (c >= '0' && c <= '9') || c == '.' {
+			continue
+		}
+		numStr = s[:i]
+		unit = strings.ToLower(strings.TrimSpace(s[i:]))
+		break
+	}
+	n, err := strconv.ParseFloat(numStr, 64)
+	if err != nil {
+		return 0
+	}
+	var mult int64
+	switch unit {
+	case "", "b":
+		mult = 1
+	case "k", "kb":
+		mult = 1024
+	case "m", "mb":
+		mult = 1024 * 1024
+	case "g", "gb":
+		mult = 1024 * 1024 * 1024
+	default:
+		return 0
+	}
+	return int64(n * float64(mult))
 }

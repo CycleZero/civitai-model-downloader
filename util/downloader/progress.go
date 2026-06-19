@@ -1,5 +1,6 @@
-// Package downloader provides a multi-threaded, resumable HTTP file downloader
-// with progress tracking and graceful cancellation support.
+// Package downloader provides a multi-threaded, resumable HTTP file
+// downloader with dynamic chunk-based work distribution, progress
+// tracking, and graceful cancellation support.
 package downloader
 
 import (
@@ -11,7 +12,7 @@ import (
 	"time"
 )
 
-// Progress represents the current state of a segment download.
+// Progress represents the current state of a chunk download.
 type Progress struct {
 	SegmentIndex int
 	Downloaded   int64
@@ -20,25 +21,25 @@ type Progress struct {
 	Error        error
 }
 
-// ProgressBar collects progress updates from all segments and renders
-// a real-time terminal display showing overall progress, transfer speed,
-// and per-segment status.
+// ProgressBar collects progress updates from all workers and renders
+// a real-time terminal display showing overall progress, transfer
+// speed, and per-chunk completion count.
 type ProgressBar struct {
-	mu            sync.Mutex
-	segments      []*segmentStatus
-	totalSize     int64
-	downloaded    atomic.Int64
-	startTime     time.Time
-	lastBytes     int64
-	lastTime      time.Time
-	speed         float64
-	stopped       bool
-	segmentsDone  atomic.Int32
-	totalSegments int
-	lastDrawLen   int
+	mu           sync.Mutex
+	chunks       []*chunkStatus
+	totalSize    int64
+	downloaded   atomic.Int64
+	startTime    time.Time
+	lastBytes    int64
+	lastTime     time.Time
+	speed        float64
+	stopped      bool
+	chunksDone   atomic.Int32
+	totalChunks  int
+	lastDrawLen  int
 }
 
-type segmentStatus struct {
+type chunkStatus struct {
 	index      int
 	downloaded int64
 	total      int64
@@ -46,23 +47,35 @@ type segmentStatus struct {
 	err        error
 }
 
-// NewProgressBar creates a new ProgressBar for the given number of segments
-// and total download size.
-func NewProgressBar(segments int, totalSize int64) *ProgressBar {
+// NewProgressBar creates a ProgressBar for totalChunks chunks and a
+// total download size of totalSize bytes.
+func NewProgressBar(totalChunks int, totalSize int64) *ProgressBar {
 	pb := &ProgressBar{
-		segments:      make([]*segmentStatus, segments),
-		totalSize:     totalSize,
-		startTime:     time.Now(),
-		lastTime:      time.Now(),
-		totalSegments: segments,
+		chunks:       make([]*chunkStatus, totalChunks),
+		totalSize:    totalSize,
+		startTime:    time.Now(),
+		lastTime:     time.Now(),
+		totalChunks:  totalChunks,
 	}
-	for i := 0; i < segments; i++ {
-		pb.segments[i] = &segmentStatus{index: i}
+	for i := 0; i < totalChunks; i++ {
+		pb.chunks[i] = &chunkStatus{index: i}
 	}
 	return pb
 }
 
-// Update receives a Progress update from a segment and refreshes the display.
+// SetCompleted pre-records already-finished chunks (resume scenario).
+// initialBytes is the sum of bytes from chunks already done. This
+// prevents the bar from starting at 0% when resuming a partial file.
+func (pb *ProgressBar) SetCompleted(initialBytes int64, completedChunks int) {
+	pb.mu.Lock()
+	defer pb.mu.Unlock()
+	pb.downloaded.Store(initialBytes)
+	pb.lastBytes = initialBytes
+	pb.chunksDone.Store(int32(completedChunks))
+}
+
+// Update receives a Progress update from a worker and refreshes the
+// display. It is safe to call concurrently from multiple workers.
 func (pb *ProgressBar) Update(p Progress) {
 	pb.mu.Lock()
 	defer pb.mu.Unlock()
@@ -71,24 +84,28 @@ func (pb *ProgressBar) Update(p Progress) {
 		return
 	}
 
-	segIdx := p.SegmentIndex
-	if segIdx >= 0 && segIdx < len(pb.segments) {
-		pb.segments[segIdx].downloaded = p.Downloaded
-		pb.segments[segIdx].total = p.Total
+	idx := p.SegmentIndex
+	if idx >= 0 && idx < len(pb.chunks) {
+		pb.chunks[idx].downloaded = p.Downloaded
+		pb.chunks[idx].total = p.Total
 		if p.Done {
-			if !pb.segments[segIdx].done {
-				pb.segmentsDone.Add(1)
+			if !pb.chunks[idx].done {
+				pb.chunksDone.Add(1)
 			}
-			pb.segments[segIdx].done = true
+			pb.chunks[idx].done = true
 		}
 		if p.Error != nil {
-			pb.segments[segIdx].err = p.Error
+			pb.chunks[idx].err = p.Error
 		}
 	}
 
 	var currentBytes int64
-	for _, s := range pb.segments {
-		currentBytes += s.downloaded
+	for _, c := range pb.chunks {
+		if c.done {
+			currentBytes += c.total
+		} else {
+			currentBytes += c.downloaded
+		}
 	}
 	pb.downloaded.Store(currentBytes)
 
@@ -113,11 +130,9 @@ func (pb *ProgressBar) Stop() {
 	pb.mu.Lock()
 	defer pb.mu.Unlock()
 	pb.stopped = true
-	// Print a newline to finalize the progress line.
 	fmt.Fprintln(os.Stderr)
 }
 
-// render draws the current progress to stderr using carriage return.
 func (pb *ProgressBar) render() {
 	downloaded := pb.downloaded.Load()
 
@@ -149,10 +164,10 @@ func (pb *ProgressBar) render() {
 		}
 	}
 
-	doneCount := pb.segmentsDone.Load()
+	doneCount := pb.chunksDone.Load()
 
-	line := fmt.Sprintf("\r  %s %5.1f%%%s %s%s [%d/%d]",
-		bar, pct, sizeStr, speedStr, etaStr, doneCount, pb.totalSegments)
+	line := fmt.Sprintf("\r  %s %5.1f%%%s %s%s [%d/%d chunks]",
+		bar, pct, sizeStr, speedStr, etaStr, doneCount, pb.totalChunks)
 
 	clearLen := pb.lastDrawLen - len([]rune(line))
 	if clearLen > 0 {
@@ -163,7 +178,6 @@ func (pb *ProgressBar) render() {
 	fmt.Fprint(os.Stderr, line)
 }
 
-// progressBarString returns a simple text-based progress bar.
 func (pb *ProgressBar) progressBarString(pct float64, width int) string {
 	filled := int(pct * float64(width) / 100)
 	if filled > width {
@@ -175,7 +189,6 @@ func (pb *ProgressBar) progressBarString(pct float64, width int) string {
 	return "[" + strings.Repeat("=", filled) + strings.Repeat(" ", width-filled) + "]"
 }
 
-// bytesHuman converts bytes to a human-readable string.
 func bytesHuman(b float64) string {
 	const unit = 1024
 	if b < unit {

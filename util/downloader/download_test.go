@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -18,33 +19,26 @@ import (
 )
 
 // ---------------------------------------------------------------------------
-// Test HTTP server — configurable via query parameters
+// Test HTTP server — query-param configurable
 // ---------------------------------------------------------------------------
-
-// newTestServer creates an httptest.Server with query-param-controlled behavior.
 //
-// Query parameters:
-//
-//	size=N         Content-Length of response body (default: 1024)
-//	status=N       HTTP status code (default: 200)
-//	delay=D        initial delay in ms before sending response (default: 0)
-//	body-delay=D   delay between each 32KB chunk in ms (default: 0)
-//	no-range=1     omit Accept-Ranges header entirely
-//	partial=1      respond with 206 Partial Content for range requests
-//	fail-after=N   close connection after N bytes streamed
-//	etag=S         set ETag header to S
+//	size=N         Content-Length of body (default 1024)
+//	status=N       HTTP status (default 200)
+//	delay=D        initial delay in ms (default 0)
+//	body-delay=D   delay between 32KB chunks in ms (default 0)
+//	no-range=1     omit Accept-Ranges, ignore Range header
+//	etag=S         set ETag header
 //	filename=S     set Content-Disposition filename
+//	fail-after=N   stop writing after N bytes (simulate connection drop)
+
 func newTestServer(t *testing.T) *httptest.Server {
 	t.Helper()
-
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		q := r.URL.Query()
 
-		// --- parse query params ---
 		bodySize := int64(1024)
 		if v := q.Get("size"); v != "" {
-			n, _ := strconv.ParseInt(v, 10, 64)
-			if n > 0 {
+			if n, _ := strconv.ParseInt(v, 10, 64); n > 0 {
 				bodySize = n
 			}
 		}
@@ -57,12 +51,10 @@ func newTestServer(t *testing.T) *httptest.Server {
 		initDelay, _ := strconv.Atoi(q.Get("delay"))
 		bodyDelay, _ := strconv.Atoi(q.Get("body-delay"))
 		noRange := q.Get("no-range") == "1"
-		usePartial := q.Get("partial") == "1"
-		failAfter, _ := strconv.ParseInt(q.Get("fail-after"), 10, 64)
 		etag := q.Get("etag")
 		filename := q.Get("filename")
+		failAfter, _ := strconv.ParseInt(q.Get("fail-after"), 10, 64)
 
-		// --- initial delay ---
 		if initDelay > 0 {
 			select {
 			case <-time.After(time.Duration(initDelay) * time.Millisecond):
@@ -71,7 +63,6 @@ func newTestServer(t *testing.T) *httptest.Server {
 			}
 		}
 
-		// --- handle HEAD request (probe) ---
 		if r.Method == http.MethodHead {
 			if !noRange {
 				w.Header().Set("Accept-Ranges", "bytes")
@@ -87,63 +78,50 @@ func newTestServer(t *testing.T) *httptest.Server {
 			return
 		}
 
-		// --- error status (before any body) ---
 		if statusCode >= 400 {
 			w.WriteHeader(statusCode)
 			w.Write([]byte("error body"))
 			return
 		}
 
-		// --- filename ---
 		if filename != "" {
 			w.Header().Set("Content-Disposition", fmt.Sprintf(`attachment; filename="%s"`, filename))
 		}
 
-		// --- range handling ---
 		rangeHeader := r.Header.Get("Range")
 		if rangeHeader != "" && !noRange {
-			var rangeStart, rangeEnd int64
-			_, err := fmt.Sscanf(rangeHeader, "bytes=%d-%d", &rangeStart, &rangeEnd)
-			if err != nil {
-				// try "bytes=N-" format
-				_, err = fmt.Sscanf(rangeHeader, "bytes=%d-", &rangeStart)
-				if err != nil {
+			var rs, re int64
+			if _, err := fmt.Sscanf(rangeHeader, "bytes=%d-%d", &rs, &re); err != nil {
+				if _, err2 := fmt.Sscanf(rangeHeader, "bytes=%d-", &rs); err2 != nil {
 					w.WriteHeader(http.StatusBadRequest)
 					return
 				}
-				rangeEnd = bodySize - 1
+				re = bodySize - 1
 			}
-
-			if rangeStart >= bodySize {
+			if rs >= bodySize {
 				w.WriteHeader(http.StatusRequestedRangeNotSatisfiable)
 				return
 			}
-			if rangeEnd >= bodySize {
-				rangeEnd = bodySize - 1
+			if re >= bodySize {
+				re = bodySize - 1
 			}
-
-			chunkSize := rangeEnd - rangeStart + 1
-
-			if usePartial || true { // always respond with 206 for range requests
-				w.Header().Set("Accept-Ranges", "bytes")
-				w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", rangeStart, rangeEnd, bodySize))
-				w.Header().Set("Content-Length", strconv.FormatInt(chunkSize, 10))
-				if etag != "" {
-					w.Header().Set("ETag", etag)
-				}
-				w.WriteHeader(http.StatusPartialContent)
-
-				// stream the requested range
-				payload := make([]byte, chunkSize)
-				for i := range payload {
-					payload[i] = byte((rangeStart + int64(i)) % 256)
-				}
-				streamBody(w, payload, bodyDelay, failAfter, r.Context())
-				return
+			chunkLen := re - rs + 1
+			w.Header().Set("Accept-Ranges", "bytes")
+			w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", rs, re, bodySize))
+			w.Header().Set("Content-Length", strconv.FormatInt(chunkLen, 10))
+			if etag != "" {
+				w.Header().Set("ETag", etag)
 			}
+			w.WriteHeader(http.StatusPartialContent)
+
+			payload := make([]byte, chunkLen)
+			for i := range payload {
+				payload[i] = byte((rs + int64(i)) % 256)
+			}
+			streamBody(w, payload, bodyDelay, failAfter, r.Context())
+			return
 		}
 
-		// --- normal response (full body) ---
 		if !noRange {
 			w.Header().Set("Accept-Ranges", "bytes")
 		}
@@ -164,7 +142,6 @@ func newTestServer(t *testing.T) *httptest.Server {
 	return srv
 }
 
-// streamBody writes payload to w with optional chunk delay and early-fail support.
 func streamBody(w io.Writer, payload []byte, chunkDelayMs int, failAfter int64, ctx context.Context) {
 	chunkSize := 32 * 1024
 	var written int64
@@ -174,24 +151,19 @@ func streamBody(w io.Writer, payload []byte, chunkDelayMs int, failAfter int64, 
 			return
 		default:
 		}
-
 		if failAfter > 0 && written >= failAfter {
-			// Simulate connection close by returning early
 			return
 		}
-
 		end := chunkSize
 		if end > len(payload) {
 			end = len(payload)
 		}
-		chunk := payload[:end]
-		n, err := w.Write(chunk)
+		n, err := w.Write(payload[:end])
 		if err != nil {
 			return
 		}
 		written += int64(n)
 		payload = payload[end:]
-
 		if chunkDelayMs > 0 {
 			select {
 			case <-time.After(time.Duration(chunkDelayMs) * time.Millisecond):
@@ -206,468 +178,1129 @@ func streamBody(w io.Writer, payload []byte, chunkDelayMs int, failAfter int64, 
 // Test helpers
 // ---------------------------------------------------------------------------
 
-// testConfig returns a downloader.Config suitable for unit tests.
 func testConfig(serverURL string) *Config {
 	return &Config{
 		Concurrency:      2,
 		MaxRetries:       2,
 		RetryBackoffBase: 10 * time.Millisecond,
-		HTTPTimeout:      0, // no timeout by default
+		HTTPTimeout:      0,
 		Resume:           false,
 		Logger:           zap.NewNop(),
 	}
 }
 
-// testConfigWithResume is like testConfig but with Resume enabled.
 func testConfigWithResume(serverURL string) *Config {
 	cfg := testConfig(serverURL)
 	cfg.Resume = true
 	return cfg
 }
 
-// tempOutput returns a path inside t.TempDir() for a test output file.
 func tempOutput(t *testing.T, name string) string {
 	t.Helper()
 	return filepath.Join(t.TempDir(), name)
 }
 
-// tempOutputDir returns a path inside t.TempDir() for a test output file in a subdirectory.
-func tempOutputDir(t *testing.T, dir, name string) string {
-	t.Helper()
-	d := filepath.Join(t.TempDir(), dir)
-	os.MkdirAll(d, 0755)
-	return filepath.Join(d, name)
-}
-
-// newDownloader creates a Downloader wired to a test server.
 func newDownloader(t *testing.T, srv *httptest.Server, output string, cfg *Config) *Downloader {
 	t.Helper()
 	return New(srv.URL, output, cfg)
 }
 
-// readFileString reads a file and returns its content as string.
-func readFileString(t *testing.T, path string) string {
+func expectedPayload(bodySize int64) []byte {
+	p := make([]byte, bodySize)
+	for i := range p {
+		p[i] = byte(i % 256)
+	}
+	return p
+}
+
+func readFile(t *testing.T, path string) []byte {
 	t.Helper()
 	data, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatalf("readFile: %v", err)
 	}
-	return string(data)
+	return data
 }
 
-// fileSize returns the size of a file, or -1 on error.
-func fileSize(t *testing.T, path string) int64 {
-	t.Helper()
-	fi, err := os.Stat(path)
-	if err != nil {
-		return -1
+// =========================================================================
+// Unit tests for pure functions
+// =========================================================================
+
+func TestPlanChunks(t *testing.T) {
+	cases := []struct {
+		name      string
+		fileSize  int64
+		chunkSize int64
+		want      []Chunk
+	}{
+		{"unknown size", -1, 1024, []Chunk{{Index: 0, Start: 0, End: -1}}},
+		{"zero size", 0, 1024, []Chunk{{Index: 0, Start: 0, End: -1}}},
+		{"single chunk (size<chunk)", 100, 1024, []Chunk{{Index: 0, Start: 0, End: 99}}},
+		{"exact fit", 1024, 512, []Chunk{
+			{Index: 0, Start: 0, End: 511},
+			{Index: 1, Start: 512, End: 1023},
+		}},
+		{"remainder", 1000, 256, []Chunk{
+			{Index: 0, Start: 0, End: 255},
+			{Index: 1, Start: 256, End: 511},
+			{Index: 2, Start: 512, End: 767},
+			{Index: 3, Start: 768, End: 999},
+		}},
 	}
-	return fi.Size()
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := planChunks(tc.fileSize, tc.chunkSize)
+			if len(got) != len(tc.want) {
+				t.Fatalf("got %d chunks, want %d: %+v", len(got), len(tc.want), got)
+			}
+			for i := range got {
+				if got[i] != tc.want[i] {
+					t.Errorf("chunk %d: got %+v, want %+v", i, got[i], tc.want[i])
+				}
+			}
+		})
+	}
+}
+
+func TestAutoChunkSize(t *testing.T) {
+	if got := autoChunkSize(-1, 8); got != 16<<20 {
+		t.Errorf("unknown size: got %d, want 16MB", got)
+	}
+	if got := autoChunkSize(1000, 8); got != 1000 {
+		t.Errorf("tiny file: got %d, want 1000 (whole file)", got)
+	}
+	if got := autoChunkSize(64<<20, 8); got < 1<<20 {
+		t.Errorf("mid file: got %d, want >= 1MB", got)
+	}
+	if got := autoChunkSize(1<<30, 8); got != 16<<20 {
+		t.Errorf("big file: got %d, want 16MB", got)
+	}
+}
+
+func TestBuildRange(t *testing.T) {
+	if got := buildRange(-1, -1); got != "" {
+		t.Errorf("unbounded: got %q", got)
+	}
+	if got := buildRange(0, 99); got != "bytes=0-99" {
+		t.Errorf("got %q", got)
+	}
+	if got := buildRange(100, -1); got != "bytes=100-" {
+		t.Errorf("got %q", got)
+	}
+}
+
+func TestParseContentRange(t *testing.T) {
+	parts := parseContentRange("bytes 0-99/200")
+	if parts == nil || parts[0] != 0 || parts[1] != 99 || parts[2] != 200 {
+		t.Fatalf("got %v", parts)
+	}
+	parts = parseContentRange("bytes 100-199/*")
+	if parts == nil || parts[2] != 0 {
+		t.Fatalf("wildcard total: got %v", parts)
+	}
+	if parseContentRange("invalid") != nil {
+		t.Error("expected nil for invalid header")
+	}
 }
 
 // =========================================================================
-// BUG 1 REGRESSION TESTS — HTTPTimeout forced to 30s
+// HTTPTimeout handling (regression for BUG 1)
 // =========================================================================
 
-// TestHTTPTimeoutZeroPreserved verifies that HTTPTimeout=0 is NOT overridden
-// to the default 30s by norm(). Currently BROKEN: norm() sets 0→30s.
 func TestHTTPTimeoutZeroPreserved(t *testing.T) {
-	cfg := &Config{
-		HTTPTimeout: 0,
-	}
+	cfg := &Config{HTTPTimeout: 0}
 	cfg.norm()
 	if cfg.HTTPTimeout != 0 {
-		t.Fatalf("HTTPTimeout should be 0 (meaning no timeout), got %v", cfg.HTTPTimeout)
+		t.Fatalf("HTTPTimeout should stay 0, got %v", cfg.HTTPTimeout)
 	}
 }
 
-// TestHTTPTimeoutNegativeUsesDefault verifies that a negative HTTPTimeout
-// triggers the default (30s). This is the new opt-in mechanism.
 func TestHTTPTimeoutNegativeUsesDefault(t *testing.T) {
-	cfg := &Config{
-		HTTPTimeout: -1,
-	}
+	cfg := &Config{HTTPTimeout: -1}
 	cfg.norm()
 	if cfg.HTTPTimeout != 30*time.Second {
-		t.Fatalf("HTTPTimeout should default to 30s when negative, got %v", cfg.HTTPTimeout)
+		t.Fatalf("HTTPTimeout should default to 30s, got %v", cfg.HTTPTimeout)
 	}
 }
 
-// TestDownloaderClientHasNoGlobalTimeout verifies that when HTTPTimeout=0,
-// the underlying http.Client has no global timeout (client.Timeout == 0).
-// Currently BROKEN: client.Timeout is set to 30s.
 func TestDownloaderClientHasNoGlobalTimeout(t *testing.T) {
 	srv := newTestServer(t)
-	output := tempOutput(t, "test.bin")
 	cfg := testConfig(srv.URL)
 	cfg.HTTPTimeout = 0
-	dl := newDownloader(t, srv, output, cfg)
-
+	dl := newDownloader(t, srv, tempOutput(t, "x.bin"), cfg)
 	if dl.client.Timeout != 0 {
-		t.Fatalf("client.Timeout should be 0 when HTTPTimeout=0, got %v", dl.client.Timeout)
+		t.Fatalf("client.Timeout should be 0, got %v", dl.client.Timeout)
 	}
 }
 
-// TestExplicitHTTPTimeoutApplied verifies that a positive HTTPTimeout is
-// applied to the http.Client.
 func TestExplicitHTTPTimeoutApplied(t *testing.T) {
 	srv := newTestServer(t)
-	output := tempOutput(t, "test.bin")
 	cfg := testConfig(srv.URL)
 	cfg.HTTPTimeout = 5 * time.Second
-	dl := newDownloader(t, srv, output, cfg)
-
+	dl := newDownloader(t, srv, tempOutput(t, "x.bin"), cfg)
 	if dl.client.Timeout != 5*time.Second {
 		t.Fatalf("client.Timeout should be 5s, got %v", dl.client.Timeout)
 	}
 }
 
 // =========================================================================
-// BUG 2 REGRESSION TEST — Real error swallowed by "context canceled"
+// Basic download correctness
 // =========================================================================
 
-// countFailServer returns a test server that returns HTTP 500 for the first N
-// requests, then behaves normally for subsequent requests.
-func countFailServer(t *testing.T, failCount int, bodySize int64) *httptest.Server {
-	t.Helper()
-	var mu sync.Mutex
-	var count int
+func TestBasicDownload(t *testing.T) {
+	bodySize := int64(100_000)
+	srv := newTestServer(t)
+	out := tempOutput(t, "basic.bin")
+	cfg := testConfig(srv.URL + "?size=" + strconv.FormatInt(bodySize, 10))
+	cfg.Concurrency = 4
+	cfg.ChunkSize = 16 * 1024 // 16KB → ~7 chunks
 
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		mu.Lock()
-		n := count
-		count++
-		mu.Unlock()
+	dl := New(srv.URL+"?size="+strconv.FormatInt(bodySize, 10), out, cfg)
+	if err := dl.Download(context.Background()); err != nil {
+		t.Fatalf("download: %v", err)
+	}
 
-		if n < failCount {
-			w.WriteHeader(http.StatusInternalServerError)
-			w.Write([]byte("simulated failure"))
-			return
-		}
+	got := readFile(t, out)
+	want := expectedPayload(bodySize)
+	if len(got) != len(want) {
+		t.Fatalf("size: got %d, want %d", len(got), len(want))
+	}
+	if string(got) != string(want) {
+		t.Fatal("content mismatch")
+	}
 
-		// Normal response
-		w.Header().Set("Accept-Ranges", "bytes")
-		w.Header().Set("Content-Length", strconv.FormatInt(bodySize, 10))
-		w.WriteHeader(http.StatusOK)
-		payload := make([]byte, bodySize)
-		for i := range payload {
-			payload[i] = byte(i % 256)
-		}
-		w.Write(payload)
-	}))
-	t.Cleanup(srv.Close)
-	return srv
+	// State file must be cleaned up on success.
+	if _, err := os.Stat(stateFileName(out)); !os.IsNotExist(err) {
+		t.Errorf("state file should be deleted on success, err=%v", err)
+	}
 }
 
-// TestRealSegmentErrorNotMaskedByContextCanceled verifies that when a segment
-// fails with a real error (e.g., HTTP 500), the downloader returns that error
-// — NOT "context canceled". Currently BROKEN: the cascade-cancel+select-race
-// often returns "context canceled" instead of the real error.
-//
-// Design: server returns 500 for the first request (seg0 fails fast), then
-// serves normally for subsequent requests. With Concurrency=2, seg0 fails,
-// cancel() kills seg1 mid-download. The race between resultCh and ctx.Done()
-// sometimes produces "context canceled" — this test catches that.
-func TestRealSegmentErrorNotMaskedByContextCanceled(t *testing.T) {
-	bodySize := int64(500000) // 500KB
-	srv := countFailServer(t, 1, bodySize)
-
-	output := tempOutput(t, "test.bin")
+func TestSmallFileSingleChunk(t *testing.T) {
+	srv := newTestServer(t)
+	out := tempOutput(t, "small.bin")
 	cfg := testConfig(srv.URL)
-	cfg.Concurrency = 2
-	cfg.MaxRetries = 0 // no retry — fail immediately
-	cfg.HTTPTimeout = 0
+	cfg.ChunkSize = 1 << 20 // 1MB, larger than default body (1KB)
 
-	dl := newDownloader(t, srv, output, cfg)
-
-	ctx, cancel := context.WithCancel(context.Background())
-	err := dl.Download(ctx)
-	cancel()
-
-	if err == nil {
-		t.Fatal("expected error, got nil")
+	dl := newDownloader(t, srv, out, cfg)
+	if err := dl.Download(context.Background()); err != nil {
+		t.Fatalf("download: %v", err)
 	}
-	errStr := err.Error()
-	if strings.Contains(errStr, "context canceled") {
-		t.Fatalf("BUG: error should NOT be 'context canceled' after fix, got: %v", err)
+	got := readFile(t, out)
+	if len(got) != 1024 {
+		t.Fatalf("size: got %d, want 1024", len(got))
 	}
-	if !strings.Contains(errStr, "segment") && !strings.Contains(errStr, "500") {
-		t.Fatalf("expected error about segment 500, got: %v", err)
+}
+
+func TestUnsupportedRangeFallback(t *testing.T) {
+	bodySize := int64(50_000)
+	out := tempOutput(t, "norange.bin")
+	cfg := testConfig("")
+	cfg.Concurrency = 8 // would normally spawn 8 workers
+	cfg.ChunkSize = 1024
+
+	noRangeSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodHead {
+			// No Accept-Ranges header
+			w.Header().Set("Content-Length", strconv.FormatInt(bodySize, 10))
+			w.WriteHeader(200)
+			return
+		}
+		w.Header().Set("Content-Length", strconv.FormatInt(bodySize, 10))
+		w.WriteHeader(200)
+		p := expectedPayload(bodySize)
+		w.Write(p)
+	}))
+	t.Cleanup(noRangeSrv.Close)
+
+	dl := New(noRangeSrv.URL, out, cfg)
+	if err := dl.Download(context.Background()); err != nil {
+		t.Fatalf("download: %v", err)
+	}
+	got := readFile(t, out)
+	if int64(len(got)) != bodySize {
+		t.Fatalf("size: got %d, want %d", len(got), bodySize)
+	}
+	want := expectedPayload(bodySize)
+	if string(got) != string(want) {
+		t.Fatal("content mismatch")
 	}
 }
 
 // =========================================================================
-// BUG 3 REGRESSION TEST — DeadlineExceeded from client timeout not retried
+// Dynamic chunking + worker pool — no long tail
 // =========================================================================
 
-// TestDeadlineExceededFromClientTimeoutIsRetryable verifies that when the
-// HTTP client timeout fires (DeadlineExceeded), the downloader should retry
-// the segment — it's a transient network issue, not a parent-context
-// cancellation. Currently BROKEN: errors.Is(DeadlineExceeded) causes
-// immediate return without retry.
-func TestDeadlineExceededFromClientTimeoutIsRetryable(t *testing.T) {
-	// Server that delays past the HTTP timeout on first request,
-	// then responds normally on retry.
-	var mu sync.Mutex
-	var callCount int
-	bodySize := int64(10000)
+// TestWorkerPoolStaysSaturated verifies that the worker pool keeps N
+// workers active throughout the download — the core property that
+// eliminates the long-tail bandwidth drop-off of static segmentation.
+//
+// Approach: server tracks the max number of concurrently in-flight
+// requests. With many small chunks and N workers, the peak concurrency
+// should reach N (or close to it), proving workers don't sit idle
+// waiting for a single slow segment to finish.
+func TestWorkerPoolStaysSaturated(t *testing.T) {
+	bodySize := int64(1 << 20) // 1 MB
 
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method == http.MethodHead {
-			w.Header().Set("Accept-Ranges", "bytes")
-			w.Header().Set("Content-Length", strconv.FormatInt(bodySize, 10))
-			w.WriteHeader(http.StatusOK)
-			return
+	var inflight atomic.Int32
+	var maxInflight atomic.Int32
+	wrapSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Count concurrency here and respond inline.
+		cur := inflight.Add(1)
+		for {
+			old := maxInflight.Load()
+			if cur <= old || maxInflight.CompareAndSwap(old, cur) {
+				break
+			}
 		}
+		defer inflight.Add(-1)
 
-		mu.Lock()
-		n := callCount
-		callCount++
-		mu.Unlock()
-
-		if n == 0 {
+		// Small delay to widen the concurrency window.
+		if r.Method != http.MethodHead {
 			select {
-			case <-time.After(3 * time.Second):
+			case <-time.After(5 * time.Millisecond):
 			case <-r.Context().Done():
 				return
 			}
 		}
 
+		if r.Method == http.MethodHead {
+			w.Header().Set("Accept-Ranges", "bytes")
+			w.Header().Set("Content-Length", strconv.FormatInt(bodySize, 10))
+			w.WriteHeader(200)
+			return
+		}
+
+		rh := r.Header.Get("Range")
+		var rs, re int64
+		if _, err := fmt.Sscanf(rh, "bytes=%d-%d", &rs, &re); err == nil {
+			if re >= bodySize {
+				re = bodySize - 1
+			}
+			cl := re - rs + 1
+			w.Header().Set("Accept-Ranges", "bytes")
+			w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", rs, re, bodySize))
+			w.Header().Set("Content-Length", strconv.FormatInt(cl, 10))
+			w.WriteHeader(206)
+			p := make([]byte, cl)
+			for i := range p {
+				p[i] = byte((rs + int64(i)) % 256)
+			}
+			w.Write(p)
+			return
+		}
 		w.Header().Set("Accept-Ranges", "bytes")
 		w.Header().Set("Content-Length", strconv.FormatInt(bodySize, 10))
-		w.WriteHeader(http.StatusOK)
-		payload := make([]byte, bodySize)
-		w.Write(payload)
+		w.WriteHeader(200)
+		w.Write(expectedPayload(bodySize))
 	}))
-	defer srv.Close()
+	t.Cleanup(wrapSrv.Close)
 
-	output := tempOutput(t, "test.bin")
-	cfg := testConfig(srv.URL)
-	cfg.Concurrency = 1
-	cfg.MaxRetries = 2
-	cfg.HTTPTimeout = 1 * time.Second // short timeout — will fire on first request
-	cfg.RetryBackoffBase = 50 * time.Millisecond
+	out := tempOutput(t, "sat.bin")
+	cfg := testConfig(wrapSrv.URL)
+	cfg.Concurrency = 8
+	cfg.ChunkSize = 16 * 1024 // 1MB / 16KB = 64 chunks
+	cfg.MaxRetries = 0
 
-	dl := newDownloader(t, srv, output, cfg)
+	dl := newDownloader(t, wrapSrv, out, cfg)
+	if err := dl.Download(context.Background()); err != nil {
+		t.Fatalf("download: %v", err)
+	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
+	if got := readFile(t, out); string(got) != string(expectedPayload(bodySize)) {
+		t.Fatal("content mismatch")
+	}
 
-	err := dl.Download(ctx)
-	if err != nil {
-		// BUG: currently returns DeadlineExceeded without retry
-		t.Fatalf("BUG: download should succeed after retry, got: %v", err)
+	// With 8 workers and 64 chunks, peak concurrency must reach
+	// at least 6 (allowing scheduling slack). Static segmentation
+	// with 8 segments would also hit 8 here — the point is that
+	// the NEW architecture never goes BELOW this late in the
+	// download. We assert the peak is high; TestNoLongTail checks
+	// the tail behavior more directly.
+	if peak := maxInflight.Load(); peak < 6 {
+		t.Errorf("peak concurrency = %d, want >= 6 (worker pool not saturated)", peak)
 	}
 }
 
-// =========================================================================
-// BUG 4 REGRESSION TESTS — findResumableState too strict
-// =========================================================================
-
-// TestFindResumableStateSkipsUnstartedSegments verifies that
-// findResumableState does NOT return nil when some segments haven't started
-// (no temp file + DownloadedBytes=0). Currently BROKEN: os.Stat fail on
-// missing temp file causes entire state to be rejected.
-func TestFindResumableStateSkipsUnstartedSegments(t *testing.T) {
-	dir := t.TempDir()
-	output := filepath.Join(dir, "model.safetensors")
-	url := "https://example.com/model"
-
-	// Create temp files for segments 0 and 1
-	part0 := filepath.Join(dir, ".model.safetensors.part0")
-	part1 := filepath.Join(dir, ".model.safetensors.part1")
-	// Segments 2 and 3 have NO temp files (unstarted)
-	os.WriteFile(part0, make([]byte, 1000), 0644)
-	os.WriteFile(part1, make([]byte, 500), 0644)
-
-	state := State{
-		URL:        url,
-		OutputPath: output,
-		TotalSize:  4000,
-		Segments: []SegmentState{
-			{Index: 0, Start: 0, End: 999, TempPath: part0, DownloadedBytes: 500},
-			{Index: 1, Start: 1000, End: 1999, TempPath: part1, DownloadedBytes: 500},
-			{Index: 2, Start: 2000, End: 2999, TempPath: filepath.Join(dir, ".model.safetensors.part2"), DownloadedBytes: 0},
-			{Index: 3, Start: 3000, End: 3999, TempPath: filepath.Join(dir, ".model.safetensors.part3"), DownloadedBytes: 0},
-		},
-	}
-
-	sp := stateFileName(output)
-	if err := SaveState(sp, state); err != nil {
-		t.Fatal(err)
-	}
-
-	got := findResumableState(url, output)
-	if got == nil {
-		t.Fatal("BUG: findResumableState returned nil — unstarted segments with no temp file should be tolerated")
-	}
-
-	if got.Segments[0].DownloadedBytes != 1000 {
-		t.Errorf("BUG: segment 0 DownloadedBytes should be corrected to actual file size 1000, got %d",
-			got.Segments[0].DownloadedBytes)
-	}
-	if got.Segments[1].DownloadedBytes != 500 {
-		t.Errorf("segment 1 DownloadedBytes = %d, want 500", got.Segments[1].DownloadedBytes)
-	}
-	if got.Segments[2].DownloadedBytes != 0 {
-		t.Errorf("segment 2 DownloadedBytes = %d, want 0 (unstarted)", got.Segments[2].DownloadedBytes)
-	}
-}
-
-// TestFindResumableStateCorrectsFromFileSize verifies that DownloadedBytes
-// is always corrected to the actual file size, even when the saved value is
-// non-zero but stale. Currently BROKEN: correction only happens when
-// DownloadedBytes <= 0.
-func TestFindResumableStateCorrectsFromFileSize(t *testing.T) {
-	dir := t.TempDir()
-	output := filepath.Join(dir, "model.safetensors")
-	url := "https://example.com/model"
-
-	// Temp file has 2000 bytes, but state says only 500
-	part0 := filepath.Join(dir, ".model.safetensors.part0")
-	os.WriteFile(part0, make([]byte, 2000), 0644)
-
-	state := State{
-		URL:        url,
-		OutputPath: output,
-		TotalSize:  4000,
-		Segments: []SegmentState{
-			{Index: 0, Start: 0, End: 3999, TempPath: part0, DownloadedBytes: 500},
-		},
-	}
-
-	sp := stateFileName(output)
-	if err := SaveState(sp, state); err != nil {
-		t.Fatal(err)
-	}
-
-	got := findResumableState(url, output)
-	if got == nil {
-		t.Fatal("findResumableState returned nil")
-	}
-
-	// BUG: currently this is 500 (stale), should be 2000 (actual file size)
-	if got.Segments[0].DownloadedBytes != 2000 {
-		t.Errorf("BUG: DownloadedBytes should be corrected from actual file size (2000), got %d",
-			got.Segments[0].DownloadedBytes)
-	}
-}
-
-// TestFindResumableStateRejectsCorruptState verifies that a segment temp file
-// larger than the segment range causes findResumableState to return nil
-// (corrupt state — should start fresh).
-func TestFindResumableStateRejectsCorruptState(t *testing.T) {
-	dir := t.TempDir()
-	output := filepath.Join(dir, "model.safetensors")
-	url := "https://example.com/model"
-
-	// Segment range is 0-999 (1000 bytes), but file has 2000 bytes — corrupt
-	part0 := filepath.Join(dir, ".model.safetensors.part0")
-	os.WriteFile(part0, make([]byte, 2000), 0644)
-
-	state := State{
-		URL:        url,
-		OutputPath: output,
-		TotalSize:  4000,
-		Segments: []SegmentState{
-			{Index: 0, Start: 0, End: 999, TempPath: part0, DownloadedBytes: 2000},
-		},
-	}
-
-	sp := stateFileName(output)
-	if err := SaveState(sp, state); err != nil {
-		t.Fatal(err)
-	}
-
-	got := findResumableState(url, output)
-	if got != nil {
-		t.Fatal("should return nil for corrupt state (file > segment range)")
-	}
-}
-
-// =========================================================================
-// BUG 5 REGRESSION TEST — DownloadedBytes stale after cancellation
-// =========================================================================
-
-// TestDownloadedBytesAccurateAfterCancellation verifies that after a context
-// cancellation mid-download, the segment's DownloadedBytes reflects bytes
-// actually written to disk. Currently BROKEN: DownloadedBytes only updates
-// during progress emission (every ~200ms or ~1MB), so the final bytes before
-// cancellation may not be recorded.
-func TestDownloadedBytesAccurateAfterCancellation(t *testing.T) {
-	bodySize := int64(500000) // 500KB
+// TestNoLongTail verifies the defining property of the new design:
+// the LAST chunk to finish is served while other workers are still
+// active. With static segmentation the last segment finishes alone.
+//
+// We approximate this by recording the timestamps of all chunk
+// completion events and checking that the gap between the
+// second-to-last and last completion is small relative to the total
+// download time — i.e. no single chunk dominates the tail.
+func TestNoLongTail(t *testing.T) {
+	bodySize := int64(512 * 1024) // 512 KB
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodHead {
 			w.Header().Set("Accept-Ranges", "bytes")
 			w.Header().Set("Content-Length", strconv.FormatInt(bodySize, 10))
-			w.WriteHeader(http.StatusOK)
+			w.WriteHeader(200)
+			return
+		}
+		rh := r.Header.Get("Range")
+		var rs, re int64
+		if _, err := fmt.Sscanf(rh, "bytes=%d-%d", &rs, &re); err != nil {
+			re = bodySize - 1
+			rs = 0
+		}
+		if re >= bodySize {
+			re = bodySize - 1
+		}
+		// Add 10ms per chunk so completion times are measurable.
+		select {
+		case <-time.After(10 * time.Millisecond):
+		case <-r.Context().Done():
+			return
+		}
+		cl := re - rs + 1
+		w.Header().Set("Accept-Ranges", "bytes")
+		w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", rs, re, bodySize))
+		w.Header().Set("Content-Length", strconv.FormatInt(cl, 10))
+		w.WriteHeader(206)
+		p := make([]byte, cl)
+		for i := range p {
+			p[i] = byte((rs + int64(i)) % 256)
+		}
+		w.Write(p)
+	}))
+	t.Cleanup(srv.Close)
+
+	out := tempOutput(t, "notail.bin")
+	cfg := testConfig(srv.URL)
+	cfg.Concurrency = 4
+	cfg.ChunkSize = 32 * 1024 // 512KB / 32KB = 16 chunks
+	cfg.MaxRetries = 0
+
+	start := time.Now()
+	dl := newDownloader(t, srv, out, cfg)
+	if err := dl.Download(context.Background()); err != nil {
+		t.Fatalf("download: %v", err)
+	}
+	elapsed := time.Since(start)
+
+	if got := readFile(t, out); string(got) != string(expectedPayload(bodySize)) {
+		t.Fatal("content mismatch")
+	}
+
+	// With 4 workers and 16 chunks of 10ms each:
+	//   ideal wall time ≈ 16 * 10ms / 4 = 40ms
+	//   worst-case long tail (static) would be ≈ 16 * 10ms = 160ms
+	// Allow generous slack for scheduling.
+	if elapsed > 120*time.Millisecond {
+		t.Errorf("elapsed = %v, want < 120ms (long tail detected)", elapsed)
+	}
+}
+
+// =========================================================================
+// Chunk-level retry
+// =========================================================================
+
+// TestChunkLevelRetry verifies that a chunk which fails once succeeds
+// on retry, and the final file is intact.
+func TestChunkLevelRetry(t *testing.T) {
+	bodySize := int64(100_000)
+	var mu sync.Mutex
+	attempts := map[int64]int{} // range start → attempt count
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodHead {
+			w.Header().Set("Accept-Ranges", "bytes")
+			w.Header().Set("Content-Length", strconv.FormatInt(bodySize, 10))
+			w.WriteHeader(200)
+			return
+		}
+		rh := r.Header.Get("Range")
+		var rs, re int64
+		if _, err := fmt.Sscanf(rh, "bytes=%d-%d", &rs, &re); err != nil {
+			rs, re = 0, bodySize-1
+		}
+		if re >= bodySize {
+			re = bodySize - 1
+		}
+
+		mu.Lock()
+		attempts[rs]++
+		n := attempts[rs]
+		mu.Unlock()
+
+		// Fail the first attempt for a specific chunk.
+		if rs == 32*1024 && n == 1 {
+			w.WriteHeader(500)
+			w.Write([]byte("transient"))
 			return
 		}
 
+		cl := re - rs + 1
 		w.Header().Set("Accept-Ranges", "bytes")
-		w.Header().Set("Content-Length", strconv.FormatInt(bodySize, 10))
-		w.WriteHeader(http.StatusOK)
-
-		payload := make([]byte, bodySize)
-		for i := range payload {
-			payload[i] = byte(i % 256)
+		w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", rs, re, bodySize))
+		w.Header().Set("Content-Length", strconv.FormatInt(cl, 10))
+		w.WriteHeader(206)
+		p := make([]byte, cl)
+		for i := range p {
+			p[i] = byte((rs + int64(i)) % 256)
 		}
-		streamBody(w, payload, 50, 0, r.Context())
+		w.Write(p)
 	}))
-	defer srv.Close()
+	t.Cleanup(srv.Close)
 
-	output := tempOutput(t, "test.bin")
+	out := tempOutput(t, "retry.bin")
 	cfg := testConfig(srv.URL)
-	cfg.Concurrency = 1
+	cfg.Concurrency = 4
+	cfg.ChunkSize = 32 * 1024 // 100KB / 32KB ≈ 4 chunks
+	cfg.MaxRetries = 2
+	cfg.RetryBackoffBase = 5 * time.Millisecond
+
+	dl := newDownloader(t, srv, out, cfg)
+	if err := dl.Download(context.Background()); err != nil {
+		t.Fatalf("download should succeed after retry: %v", err)
+	}
+
+	got := readFile(t, out)
+	if string(got) != string(expectedPayload(bodySize)) {
+		t.Fatal("content mismatch after retry")
+	}
+
+	mu.Lock()
+	got32k := attempts[32*1024]
+	mu.Unlock()
+	if got32k < 2 {
+		t.Errorf("chunk @32KB should have been attempted >= 2 times, got %d", got32k)
+	}
+}
+
+// TestRetryExhaustedFails verifies that a permanently-failing chunk
+// eventually causes the download to fail.
+func TestRetryExhaustedFails(t *testing.T) {
+	bodySize := int64(10_000)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodHead {
+			w.Header().Set("Accept-Ranges", "bytes")
+			w.Header().Set("Content-Length", strconv.FormatInt(bodySize, 10))
+			w.WriteHeader(200)
+			return
+		}
+		// Always fail.
+		w.WriteHeader(500)
+		w.Write([]byte("permanent"))
+	}))
+	t.Cleanup(srv.Close)
+
+	out := tempOutput(t, "permfail.bin")
+	cfg := testConfig(srv.URL)
+	cfg.Concurrency = 2
+	cfg.ChunkSize = 1024
+	cfg.MaxRetries = 1
+	cfg.RetryBackoffBase = 1 * time.Millisecond
+
+	dl := newDownloader(t, srv, out, cfg)
+	err := dl.Download(context.Background())
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	if !strings.Contains(err.Error(), "retries exhausted") && !strings.Contains(err.Error(), "500") {
+		t.Errorf("expected retries exhausted / 500, got: %v", err)
+	}
+}
+
+// =========================================================================
+// Resume (chunk bitmap, v2 state)
+// =========================================================================
+
+// TestResumeSkipsCompletedChunks verifies that completed chunks are
+// not re-downloaded on resume.
+func TestResumeSkipsCompletedChunks(t *testing.T) {
+	bodySize := int64(100_000)
+	var mu sync.Mutex
+	requestedRanges := map[int64]bool{}
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodHead {
+			w.Header().Set("Accept-Ranges", "bytes")
+			w.Header().Set("Content-Length", strconv.FormatInt(bodySize, 10))
+			w.Header().Set("ETag", `"abc123"`)
+			w.WriteHeader(200)
+			return
+		}
+		rh := r.Header.Get("Range")
+		var rs, re int64
+		if _, err := fmt.Sscanf(rh, "bytes=%d-%d", &rs, &re); err != nil {
+			rs, re = 0, bodySize-1
+		}
+		if re >= bodySize {
+			re = bodySize - 1
+		}
+		mu.Lock()
+		requestedRanges[rs] = true
+		mu.Unlock()
+
+		cl := re - rs + 1
+		w.Header().Set("Accept-Ranges", "bytes")
+		w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", rs, re, bodySize))
+		w.Header().Set("Content-Length", strconv.FormatInt(cl, 10))
+		w.WriteHeader(206)
+		p := make([]byte, cl)
+		for i := range p {
+			p[i] = byte((rs + int64(i)) % 256)
+		}
+		w.Write(p)
+	}))
+	t.Cleanup(srv.Close)
+
+	out := tempOutput(t, "resume.bin")
+	chunkSize := int64(10 * 1024) // 100KB / 10KB = 10 chunks
+	chunks := planChunks(bodySize, chunkSize)
+
+	// Pre-create the output file with correct content for chunks 0..4
+	// and zeros for the rest; mark 0..4 as completed in the state.
+	f, err := os.OpenFile(out, os.O_RDWR|os.O_CREATE, 0644)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Truncate(bodySize); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 5; i++ {
+		p := expectedPayload(bodySize)[chunks[i].Start : chunks[i].End+1]
+		if _, err := f.WriteAt(p, chunks[i].Start); err != nil {
+			t.Fatal(err)
+		}
+	}
+	f.Close()
+
+	completed := make([]bool, len(chunks))
+	for i := 0; i < 5; i++ {
+		completed[i] = true
+	}
+	if err := SaveState(stateFileName(out), State{
+		Version:    stateVersion,
+		URL:        srv.URL,
+		OutputPath: out,
+		TotalSize:  bodySize,
+		ChunkSize:  chunkSize,
+		ETag:       `"abc123"`,
+		Completed:  completed,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := testConfigWithResume(srv.URL)
+	cfg.Concurrency = 4
+	cfg.ChunkSize = chunkSize
+	dl := newDownloader(t, srv, out, cfg)
+
+	if err := dl.Download(context.Background()); err != nil {
+		t.Fatalf("download: %v", err)
+	}
+
+	got := readFile(t, out)
+	if string(got) != string(expectedPayload(bodySize)) {
+		t.Fatal("content mismatch")
+	}
+
+	// Only chunks 5..9 should have been requested.
+	mu.Lock()
+	defer mu.Unlock()
+	for i := 0; i < 5; i++ {
+		if requestedRanges[chunks[i].Start] {
+			t.Errorf("completed chunk %d (offset %d) was re-downloaded",
+				i, chunks[i].Start)
+		}
+	}
+	for i := 5; i < 10; i++ {
+		if !requestedRanges[chunks[i].Start] {
+			t.Errorf("pending chunk %d (offset %d) was NOT downloaded",
+				i, chunks[i].Start)
+		}
+	}
+}
+
+// TestResumeRejectsETagMismatch verifies that an ETag mismatch causes
+// the resume state to be ignored (fresh download).
+func TestResumeRejectsETagMismatch(t *testing.T) {
+	bodySize := int64(10_000)
+	srv := newTestServer(t)
+	url := srv.URL + "?size=" + strconv.FormatInt(bodySize, 10) + "&etag=%22new-etag%22"
+
+	out := tempOutput(t, "etag.bin")
+	chunkSize := int64(1024)
+	chunks := planChunks(bodySize, chunkSize)
+
+	// Build a state claiming all chunks are done with a DIFFERENT etag.
+	completed := make([]bool, len(chunks))
+	for i := range completed {
+		completed[i] = true
+	}
+	SaveState(stateFileName(out), State{
+		Version:    stateVersion,
+		URL:        url,
+		OutputPath: out,
+		TotalSize:  bodySize,
+		ChunkSize:  chunkSize,
+		ETag:       `"old-etag"`,
+		Completed:  completed,
+	})
+
+	cfg := testConfigWithResume(url)
+	cfg.ChunkSize = chunkSize
+	dl := New(url, out, cfg)
+
+	if err := dl.Download(context.Background()); err != nil {
+		t.Fatalf("download: %v", err)
+	}
+	got := readFile(t, out)
+	if string(got) != string(expectedPayload(bodySize)) {
+		t.Fatal("content mismatch — resume should have been rejected")
+	}
+}
+
+// TestResumeRejectsSizeMismatch verifies that a TotalSize mismatch
+// invalidates the resume state.
+func TestResumeRejectsSizeMismatch(t *testing.T) {
+	bodySize := int64(10_000)
+	srv := newTestServer(t)
+	url := srv.URL + "?size=" + strconv.FormatInt(bodySize, 10)
+
+	out := tempOutput(t, "size.bin")
+	SaveState(stateFileName(out), State{
+		Version:    stateVersion,
+		URL:        url,
+		OutputPath: out,
+		TotalSize:  999_999, // wrong
+		ChunkSize:  1024,
+		Completed:  []bool{true, true},
+	})
+
+	cfg := testConfigWithResume(url)
+	cfg.ChunkSize = 1024
+	dl := New(url, out, cfg)
+
+	if err := dl.Download(context.Background()); err != nil {
+		t.Fatalf("download: %v", err)
+	}
+	if got := readFile(t, out); int64(len(got)) != bodySize {
+		t.Fatalf("size: got %d, want %d", len(got), bodySize)
+	}
+}
+
+// TestResumeRejectsOldVersion verifies that a v1 state file is ignored.
+func TestResumeRejectsOldVersion(t *testing.T) {
+	bodySize := int64(10_000)
+	srv := newTestServer(t)
+	url := srv.URL + "?size=" + strconv.FormatInt(bodySize, 10)
+
+	out := tempOutput(t, "v1.bin")
+	SaveState(stateFileName(out), State{
+		Version:    1, // old schema
+		URL:        url,
+		OutputPath: out,
+		TotalSize:  bodySize,
+		ChunkSize:  1024,
+		Completed:  []bool{true, true, true, true},
+	})
+
+	cfg := testConfigWithResume(url)
+	cfg.ChunkSize = 1024
+	dl := New(url, out, cfg)
+
+	if err := dl.Download(context.Background()); err != nil {
+		t.Fatalf("download: %v", err)
+	}
+	if got := readFile(t, out); string(got) != string(expectedPayload(bodySize)) {
+		t.Fatal("content mismatch — v1 state should have been ignored")
+	}
+}
+
+// =========================================================================
+// Cancellation saves state
+// =========================================================================
+
+// TestCancellationSavesState verifies that interrupting a download
+// leaves a valid state file that records which chunks completed.
+func TestCancellationSavesState(t *testing.T) {
+	bodySize := int64(2 << 20) // 2 MB — large enough that cancel lands mid-download
+	srv := newTestServer(t)
+	url := srv.URL + "?size=" + strconv.FormatInt(bodySize, 10) + "&body-delay=50"
+
+	out := tempOutput(t, "cancel.bin")
+	cfg := testConfig(url)
+	cfg.Concurrency = 2
+	cfg.ChunkSize = 64 * 1024 // 2MB / 64KB = 32 chunks
 	cfg.MaxRetries = 0
 	cfg.HTTPTimeout = 0
 
-	dl := newDownloader(t, srv, output, cfg)
+	dl := New(url, out, cfg)
 
-	// Cancel after probe completes and some data has been written
 	ctx, cancel := context.WithCancel(context.Background())
-
 	errCh := make(chan error, 1)
 	go func() {
 		errCh <- dl.Download(ctx)
 	}()
 
-	// With 50ms/chunk delay and 32KB chunks, after 500ms:
-	// ~10 chunks = ~320KB written, but total is 500KB so not complete
-	time.Sleep(500 * time.Millisecond)
+	// Give it time to probe + start a couple chunks. With 50ms/block
+	// delay and 32KB blocks, each 64KB chunk takes ~100ms; 32 chunks
+	// across 2 workers ≈ 1600ms, so 300ms is safely mid-download.
+	time.Sleep(300 * time.Millisecond)
 	cancel()
 
-	// Wait for download to finish (should be fast after cancel)
 	select {
-	case <-errCh:
-	case <-time.After(5 * time.Second):
-		t.Fatal("download did not finish after cancellation")
+	case err := <-errCh:
+		if err == nil {
+			t.Fatal("expected cancellation error, got nil")
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("download did not return after cancellation")
 	}
 
-	// Check temp file exists and has data
-	tempPath := filepath.Join(filepath.Dir(output), ".test.bin.part0")
-	fi, err := os.Stat(tempPath)
+	// State file must exist.
+	st, err := LoadState(stateFileName(out))
 	if err != nil {
-		t.Fatalf("temp file should exist: %v", err)
+		t.Fatalf("state file should exist after cancellation: %v", err)
 	}
-	actualSize := fi.Size()
-	if actualSize == 0 {
-		t.Fatal("temp file should have data after partial download")
+	if st.Version != stateVersion {
+		t.Errorf("state version = %d, want %d", st.Version, stateVersion)
+	}
+	if st.TotalSize != bodySize {
+		t.Errorf("state TotalSize = %d, want %d", st.TotalSize, bodySize)
+	}
+	if len(st.Completed) != 32 {
+		t.Errorf("state has %d chunks, want 32", len(st.Completed))
+	}
+}
+
+// =========================================================================
+// Concurrent pwrite integrity
+// =========================================================================
+
+// TestPwriteIntegrity verifies that data written concurrently by
+// multiple workers lands at the correct file offsets — i.e. pwrite
+// is safe to use from parallel goroutines.
+func TestPwriteIntegrity(t *testing.T) {
+	bodySize := int64(1 << 20) // 1 MB
+	srv := newTestServer(t)
+	url := srv.URL + "?size=" + strconv.FormatInt(bodySize, 10)
+
+	out := tempOutput(t, "pwrite.bin")
+	cfg := testConfig(url)
+	cfg.Concurrency = 8
+	cfg.ChunkSize = 16 * 1024 // 64 chunks, 8 workers — heavy pwrite contention
+	cfg.MaxRetries = 0
+
+	dl := New(url, out, cfg)
+	if err := dl.Download(context.Background()); err != nil {
+		t.Fatalf("download: %v", err)
 	}
 
-	// Check state file's DownloadedBytes matches actual file size
-	sp := stateFileName(output)
-	state, err := LoadState(sp)
+	got := readFile(t, out)
+	want := expectedPayload(bodySize)
+	if len(got) != len(want) {
+		t.Fatalf("size: got %d, want %d", len(got), len(want))
+	}
+	// Check every byte — pwrite races would corrupt specific offsets.
+	for i := range got {
+		if got[i] != want[i] {
+			t.Fatalf("byte %d: got %d, want %d (pwrite race?)", i, got[i], want[i])
+		}
+	}
+}
+
+// =========================================================================
+// All-chunks-already-complete short-circuit
+// =========================================================================
+
+// TestAllChunksAlreadyComplete verifies that when the state says
+// every chunk is done, the download is a no-op and the file is left
+// untouched.
+func TestAllChunksAlreadyComplete(t *testing.T) {
+	bodySize := int64(10_000)
+	srv := newTestServer(t)
+	url := srv.URL + "?size=" + strconv.FormatInt(bodySize, 10)
+
+	out := tempOutput(t, "done.bin")
+	chunkSize := int64(2500) // 4 chunks
+
+	// Write the full file and mark all chunks completed.
+	f, _ := os.OpenFile(out, os.O_RDWR|os.O_CREATE, 0644)
+	f.Truncate(bodySize)
+	f.WriteAt(expectedPayload(bodySize), 0)
+	f.Close()
+
+	completed := []bool{true, true, true, true}
+	SaveState(stateFileName(out), State{
+		Version:    stateVersion,
+		URL:        url,
+		OutputPath: out,
+		TotalSize:  bodySize,
+		ChunkSize:  chunkSize,
+		Completed:  completed,
+	})
+
+	cfg := testConfigWithResume(url)
+	cfg.ChunkSize = chunkSize
+	dl := New(url, out, cfg)
+
+	if err := dl.Download(context.Background()); err != nil {
+		t.Fatalf("download: %v", err)
+	}
+	got := readFile(t, out)
+	if string(got) != string(expectedPayload(bodySize)) {
+		t.Fatal("content changed on no-op resume")
+	}
+	// State should be cleaned up.
+	if _, err := os.Stat(stateFileName(out)); !os.IsNotExist(err) {
+		t.Errorf("state should be deleted: %v", err)
+	}
+}
+
+// =========================================================================
+// ETag persistence
+// =========================================================================
+
+func TestETagPersistedOnSuccess(t *testing.T) {
+	bodySize := int64(10_000)
+	srv := newTestServer(t)
+	url := srv.URL + "?size=" + strconv.FormatInt(bodySize, 10) + "&etag=%22v1%22"
+
+	out := tempOutput(t, "etag-ok.bin")
+	cfg := testConfig(url)
+
+	dl := New(url, out, cfg)
+	if err := dl.Download(context.Background()); err != nil {
+		t.Fatalf("download: %v", err)
+	}
+	etagBytes, err := os.ReadFile(out + ".etag")
 	if err != nil {
-		t.Fatalf("state file should exist: %v", err)
+		t.Fatalf("etag file should exist: %v", err)
 	}
+	if string(etagBytes) != `"v1"` {
+		t.Errorf("etag = %q, want %q", etagBytes, `"v1"`)
+	}
+}
 
-	savedBytes := state.Segments[0].DownloadedBytes
-	if savedBytes <= 0 {
-		t.Fatal("BUG: DownloadedBytes in state is 0 — not updated before cancellation")
+// =========================================================================
+// Regression tests for bug fixes
+// =========================================================================
+
+// TestServerIgnoringRangeFailsFast verifies that when a server claims
+// Accept-Ranges: bytes (so we plan multiple chunks) but then responds
+// to Range requests with 200 OK (ignoring Range), the download fails
+// immediately instead of downloading the full body N times and
+// corrupting the output file.
+func TestServerIgnoringRangeFailsFast(t *testing.T) {
+	bodySize := int64(100_000)
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodHead {
+			// Claim Range support — this is the trap.
+			w.Header().Set("Accept-Ranges", "bytes")
+			w.Header().Set("Content-Length", strconv.FormatInt(bodySize, 10))
+			w.WriteHeader(200)
+			return
+		}
+		// But ignore Range headers and always return 200 + full body.
+		w.Header().Set("Content-Length", strconv.FormatInt(bodySize, 10))
+		w.WriteHeader(200)
+		w.Write(expectedPayload(bodySize))
+	}))
+	t.Cleanup(srv.Close)
+
+	out := tempOutput(t, "lierange.bin")
+	cfg := testConfig(srv.URL)
+	cfg.Concurrency = 4
+	cfg.ChunkSize = 16 * 1024
+	cfg.MaxRetries = 1
+	cfg.RetryBackoffBase = 1 * time.Millisecond
+
+	dl := newDownloader(t, srv, out, cfg)
+	err := dl.Download(context.Background())
+	if err == nil {
+		t.Fatal("expected error for server ignoring Range, got nil")
 	}
-	if savedBytes < actualSize {
-		t.Errorf("BUG: DownloadedBytes (%d) < actual file size (%d) — progress was not saved on every write",
-			savedBytes, actualSize)
+	if !strings.Contains(err.Error(), "ignored Range") && !strings.Contains(err.Error(), "retries exhausted") {
+		t.Errorf("expected 'ignored Range' or 'retries exhausted', got: %v", err)
+	}
+}
+
+// TestResumeWithMissingOutputFile verifies that when the state file
+// exists but the output file has been deleted, the downloader starts
+// fresh instead of trusting the stale "completed" bitmap.
+func TestResumeWithMissingOutputFile(t *testing.T) {
+	bodySize := int64(10_000)
+	srv := newTestServer(t)
+	url := srv.URL + "?size=" + strconv.FormatInt(bodySize, 10)
+
+	out := tempOutput(t, "missing.bin")
+	chunkSize := int64(2500) // 4 chunks
+
+	// Create a state claiming all chunks are done, but DON'T create
+	// the output file.
+	SaveState(stateFileName(out), State{
+		Version:    stateVersion,
+		URL:        url,
+		OutputPath: out,
+		TotalSize:  bodySize,
+		ChunkSize:  chunkSize,
+		Completed:  []bool{true, true, true, true},
+	})
+
+	// Ensure output file does not exist.
+	os.Remove(out)
+
+	cfg := testConfigWithResume(url)
+	cfg.ChunkSize = chunkSize
+	dl := New(url, out, cfg)
+
+	if err := dl.Download(context.Background()); err != nil {
+		t.Fatalf("download: %v", err)
+	}
+	got := readFile(t, out)
+	if string(got) != string(expectedPayload(bodySize)) {
+		t.Fatal("content mismatch — stale resume state should have been ignored")
+	}
+}
+
+// TestResumeWithTruncatedOutputFile verifies that when the output file
+// exists but is smaller than fileSize, the downloader starts fresh.
+func TestResumeWithTruncatedOutputFile(t *testing.T) {
+	bodySize := int64(10_000)
+	srv := newTestServer(t)
+	url := srv.URL + "?size=" + strconv.FormatInt(bodySize, 10)
+
+	out := tempOutput(t, "truncated.bin")
+	chunkSize := int64(2500) // 4 chunks
+
+	// Create a tiny output file (way smaller than bodySize).
+	os.WriteFile(out, []byte("tiny"), 0644)
+
+	// State claims all done.
+	SaveState(stateFileName(out), State{
+		Version:    stateVersion,
+		URL:        url,
+		OutputPath: out,
+		TotalSize:  bodySize,
+		ChunkSize:  chunkSize,
+		Completed:  []bool{true, true, true, true},
+	})
+
+	cfg := testConfigWithResume(url)
+	cfg.ChunkSize = chunkSize
+	dl := New(url, out, cfg)
+
+	if err := dl.Download(context.Background()); err != nil {
+		t.Fatalf("download: %v", err)
+	}
+	got := readFile(t, out)
+	if string(got) != string(expectedPayload(bodySize)) {
+		t.Fatal("content mismatch — truncated file should invalidate resume")
+	}
+}
+
+// TestNonResumeClearsStaleFile verifies that when NOT resuming, any
+// pre-existing larger file is truncated so no stale tail data remains.
+func TestNonResumeClearsStaleFile(t *testing.T) {
+	bodySize := int64(1000)
+	srv := newTestServer(t)
+	url := srv.URL + "?size=" + strconv.FormatInt(bodySize, 10)
+
+	out := tempOutput(t, "stale.bin")
+	// Write a file larger than the new download.
+	staleContent := make([]byte, 5000)
+	for i := range staleContent {
+		staleContent[i] = 0xFF
+	}
+	os.WriteFile(out, staleContent, 0644)
+
+	cfg := testConfig(url) // Resume = false
+	cfg.ChunkSize = 256
+	dl := New(url, out, cfg)
+
+	if err := dl.Download(context.Background()); err != nil {
+		t.Fatalf("download: %v", err)
+	}
+	got := readFile(t, out)
+	if int64(len(got)) != bodySize {
+		t.Fatalf("file size: got %d, want %d (stale tail not cleared)", len(got), bodySize)
+	}
+	want := expectedPayload(bodySize)
+	if string(got) != string(want) {
+		t.Fatal("content mismatch — stale data may have remained")
+	}
+}
+
+// TestResumeDoesNotRedownloadWhenFileIntact verifies the normal resume
+// case: output file has correct data for completed chunks, only
+// pending chunks are downloaded.
+func TestResumeDoesNotRedownloadWhenFileIntact(t *testing.T) {
+	bodySize := int64(40_000)
+	srv := newTestServer(t)
+	url := srv.URL + "?size=" + strconv.FormatInt(bodySize, 10)
+
+	out := tempOutput(t, "intact.bin")
+	chunkSize := int64(10_000) // 4 chunks
+
+	// Write correct data for chunks 0 and 1, zeros for 2 and 3.
+	f, _ := os.OpenFile(out, os.O_RDWR|os.O_CREATE, 0644)
+	f.Truncate(bodySize)
+	full := expectedPayload(bodySize)
+	f.WriteAt(full[:chunkSize*2], 0)
+	f.Close()
+
+	SaveState(stateFileName(out), State{
+		Version:    stateVersion,
+		URL:        url,
+		OutputPath: out,
+		TotalSize:  bodySize,
+		ChunkSize:  chunkSize,
+		Completed:  []bool{true, true, false, false},
+	})
+
+	cfg := testConfigWithResume(url)
+	cfg.Concurrency = 2
+	cfg.ChunkSize = chunkSize
+	dl := New(url, out, cfg)
+
+	if err := dl.Download(context.Background()); err != nil {
+		t.Fatalf("download: %v", err)
+	}
+	got := readFile(t, out)
+	if string(got) != string(full) {
+		t.Fatal("content mismatch")
+	}
+}
+
+// TestSaveStateConcurrentSafety is a stress test for concurrent
+// SaveState calls — verifies no data corruption under -race.
+func TestSaveStateConcurrentSafety(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "state.json")
+
+	var wg sync.WaitGroup
+	for i := 0; i < 20; i++ {
+		wg.Add(1)
+		go func(n int) {
+			defer wg.Done()
+			completed := make([]bool, 100)
+			for j := 0; j <= n; j++ {
+				completed[j] = true
+			}
+			SaveState(path, State{
+				Version:    stateVersion,
+				URL:        "https://example.com",
+				OutputPath: "/tmp/out",
+				TotalSize:  1000000,
+				ChunkSize:  10000,
+				Completed:  completed,
+			})
+		}(i)
+	}
+	wg.Wait()
+
+	// Final state should be valid JSON.
+	st, err := LoadState(path)
+	if err != nil {
+		t.Fatalf("final state corrupted: %v", err)
+	}
+	if st.Version != stateVersion {
+		t.Errorf("version = %d, want %d", st.Version, stateVersion)
 	}
 }

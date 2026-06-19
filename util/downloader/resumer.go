@@ -6,25 +6,30 @@ import (
 	"path/filepath"
 )
 
-type State struct {
-	URL        string         `json:"url"`
-	OutputPath string         `json:"output_path"`
-	TotalSize  int64          `json:"total_size"`
-	Segments   []SegmentState `json:"segments"`
-}
+// stateVersion identifies the resume-state schema. Bumping it causes
+// older state files to be ignored (a fresh download starts instead of
+// risking corruption from an incompatible layout).
+const stateVersion = 2
 
-type SegmentState struct {
-	Index           int    `json:"index"`
-	Start           int64  `json:"start"`
-	End             int64  `json:"end"`
-	TempPath        string `json:"temp_path"`
-	DownloadedBytes int64  `json:"downloaded_bytes"`
+// State is the on-disk resume state for a download. It records the
+// completion status of every chunk so that an interrupted download
+// can skip already-finished chunks on restart.
+type State struct {
+	Version      int     `json:"version"`
+	URL          string  `json:"url"`
+	OutputPath   string  `json:"output_path"`
+	TotalSize    int64   `json:"total_size"`
+	ChunkSize    int64   `json:"chunk_size"`
+	ETag         string  `json:"etag,omitempty"`
+	Completed    []bool  `json:"completed"`
+	WrittenBytes int64   `json:"written_bytes"`
 }
 
 func stateFileName(outputPath string) string {
 	return outputPath + ".dlstate"
 }
 
+// SaveState atomically writes state to path via a temp file + rename.
 func SaveState(path string, state State) error {
 	data, err := json.MarshalIndent(state, "", "  ")
 	if err != nil {
@@ -37,6 +42,7 @@ func SaveState(path string, state State) error {
 	return os.Rename(tmp, path)
 }
 
+// LoadState reads and decodes a state file.
 func LoadState(path string) (*State, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -49,10 +55,24 @@ func LoadState(path string) (*State, error) {
 	return &s, nil
 }
 
-func findResumableState(url, outputPath string) *State {
+// loadResumable loads and validates a resume state for the given
+// download. Returns nil (meaning "start fresh") when:
+//   - the state file does not exist or is unreadable;
+//   - the schema version does not match stateVersion;
+//   - URL or absolute output path differ;
+//   - TotalSize or ChunkSize differ from the current plan;
+//   - the ETag is present on both sides and differs.
+//
+// ETag mismatch is only fatal when both the saved and the freshly
+// probed ETag are non-empty, so a missing ETag on either side never
+// blocks an otherwise valid resume.
+func loadResumable(url, outputPath string, fileSize, chunkSize int64, etag string) *State {
 	sp := stateFileName(outputPath)
 	state, err := LoadState(sp)
 	if err != nil {
+		return nil
+	}
+	if state.Version != stateVersion {
 		return nil
 	}
 	if state.URL != url {
@@ -63,24 +83,19 @@ func findResumableState(url, outputPath string) *State {
 	if absOut != absSt {
 		return nil
 	}
-	for i := range state.Segments {
-		seg := &state.Segments[i]
-		fi, err := os.Stat(seg.TempPath)
-		if err != nil {
-			if os.IsNotExist(err) && seg.DownloadedBytes == 0 {
-				continue
-			}
-			return nil
-		}
-		seg.DownloadedBytes = fi.Size()
-		segSize := seg.End - seg.Start + 1
-		if segSize > 0 && seg.DownloadedBytes > segSize {
-			return nil
-		}
+	if state.TotalSize != fileSize || state.ChunkSize != chunkSize {
+		return nil
+	}
+	if state.ETag != "" && etag != "" && state.ETag != etag {
+		return nil
+	}
+	if len(state.Completed) == 0 {
+		return nil
 	}
 	return state
 }
 
+// DeleteState removes the resume state file (best-effort).
 func DeleteState(outputPath string) error {
 	return os.Remove(stateFileName(outputPath))
 }
