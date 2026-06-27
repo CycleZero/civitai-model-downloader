@@ -3,6 +3,7 @@ package cmd
 import (
 	"context"
 	"fmt"
+	"io"
 	"mime"
 	"net/http"
 	"os"
@@ -15,8 +16,8 @@ import (
 	"civitai-model-downloader/api"
 	"civitai-model-downloader/log"
 	"civitai-model-downloader/util"
-	"civitai-model-downloader/util/downloader"
 
+	"github.com/CycleZero/downloader"
 	"github.com/spf13/cobra"
 )
 
@@ -134,7 +135,18 @@ func resolveFilename(url string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	defer resp.Body.Close()
+	// Drain the body so the TCP connection returns to the idle pool
+	// for reuse by the downloader's probe/chunk requests.
+	defer func() {
+		io.Copy(io.Discard, resp.Body)
+		resp.Body.Close()
+	}()
+
+	// Surface auth/permission/not-found errors with a clear message
+	// instead of the misleading "no Content-Disposition header".
+	if resp.StatusCode >= 400 {
+		return "", fmt.Errorf("HTTP %d when resolving filename (check api-key)", resp.StatusCode)
+	}
 
 	cd := resp.Header.Get("Content-Disposition")
 	if cd == "" {

@@ -3,6 +3,7 @@ module civitai-model-downloader
 go 1.26.1
 
 require (
+	github.com/CycleZero/downloader v0.1.0
 	github.com/fatih/color v1.19.0
 	github.com/spf13/cobra v1.10.2
 	github.com/spf13/viper v1.21.0
